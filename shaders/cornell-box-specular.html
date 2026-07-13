@@ -104,6 +104,9 @@
     <span>累積サンプル数</span>
     <span class="samples" id="sampleCount">0</span>
   </div>
+  <div class="row" id="mobileNote" style="display:none;color:#f90;">
+    <span>モバイル検出: 負荷軽減のため解像度/上限を下げています</span>
+  </div>
 </div>
 <canvas id="gpuCanvas"></canvas>
 <div id="error"></div>
@@ -349,6 +352,11 @@ fn fs_display(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32>
 async function main() {
   const canvas = document.getElementById('gpuCanvas');
 
+  // レイマーチング+パストレーシングは重いので、モバイルでは内部解像度と
+  // 反射回数/レイ数の上限を下げて負荷を抑える。
+  const isMobile = matchMedia('(pointer: coarse)').matches || /Mobi|Android/i.test(navigator.userAgent);
+  const resScale = isMobile ? 0.5 : 1.0;
+
   if (!navigator.gpu) {
     showError('このブラウザはWebGPUに対応していません。\nChrome/Edge の最新版などでお試しください。');
     return;
@@ -438,8 +446,8 @@ async function main() {
   }
 
   function resize() {
-    const w = Math.max(1, Math.floor(window.innerWidth));
-    const h = Math.max(1, Math.floor(window.innerHeight));
+    const w = Math.max(1, Math.floor(window.innerWidth * resScale));
+    const h = Math.max(1, Math.floor(window.innerHeight * resScale));
     canvas.width = w;
     canvas.height = h;
     context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
@@ -450,7 +458,8 @@ async function main() {
   resize();
 
   // UI: 反射回数上限 / 1ピクセルあたりのレイ数 / グロッシー球の粗さ(変更したら蓄積をリセット)
-  let maxBounces = 6;
+  // モバイルでは上限と初期値を下げて負荷を抑える。
+  let maxBounces = isMobile ? 3 : 6;
   let raysPerPixel = 1;
   let glossyRoughness = 0.3;
   const maxBouncesInput = document.getElementById('maxBounces');
@@ -460,6 +469,14 @@ async function main() {
   const raysPerPixelVal = document.getElementById('raysPerPixelVal');
   const roughnessVal = document.getElementById('roughnessVal');
   const sampleCountEl = document.getElementById('sampleCount');
+
+  if (isMobile) {
+    maxBouncesInput.max = '6';
+    maxBouncesInput.value = String(maxBounces);
+    maxBouncesVal.textContent = String(maxBounces);
+    raysPerPixelInput.max = '3';
+    document.getElementById('mobileNote').style.display = '';
+  }
 
   maxBouncesInput.addEventListener('input', () => {
     maxBounces = parseInt(maxBouncesInput.value, 10);
