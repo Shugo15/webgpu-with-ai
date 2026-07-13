@@ -151,6 +151,9 @@
     <span>累積サンプル数</span>
     <span class="samples" id="sampleCount">0</span>
   </div>
+  <div class="row" id="mobileNote" style="display:none;color:#f90;">
+    <span>モバイル検出: 負荷軽減のため解像度/上限を下げています</span>
+  </div>
 </div>
 <canvas id="gpuCanvas"></canvas>
 <div id="error"></div>
@@ -517,6 +520,11 @@ fn fs_display(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32>
 async function main() {
   const canvas = document.getElementById('gpuCanvas');
 
+  // 海はレイマーチングによる交差判定+複数反射+複数レイ/pixelでCornell Box系より
+  // さらに重いので、モバイルでは内部解像度とデフォルト/上限値をより強めに下げる。
+  const isMobile = matchMedia('(pointer: coarse)').matches || /Mobi|Android/i.test(navigator.userAgent);
+  const resScale = isMobile ? 0.45 : 1.0;
+
   if (!navigator.gpu) {
     showError('このブラウザはWebGPUに対応していません。\nChrome/Edge の最新版などでお試しください。');
     return;
@@ -606,7 +614,7 @@ async function main() {
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
-    const size = Math.max(1, Math.floor(Math.min(window.innerWidth, window.innerHeight) * dpr));
+    const size = Math.max(1, Math.floor(Math.min(window.innerWidth, window.innerHeight) * dpr * resScale));
     canvas.width = size;
     canvas.height = size;
     context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
@@ -617,11 +625,12 @@ async function main() {
   resize();
 
   // UI: 太陽の時刻 / 粗さ / レイ数 / 反射回数 / 描画距離 / 水の色 / 強調表示
-  // (どれかを変更したら蓄積をリセットする)
+  // (どれかを変更したら蓄積をリセットする)。モバイルではレイ数・反射回数の
+  // デフォルトと上限を下げて負荷を抑える(描画距離はステップ数が固定なので負荷に影響しない)。
   let sunHour = 10.0;
   let roughness = 0.10;
-  let raysPerPixel = 2;
-  let reflectionCount = 2;
+  let raysPerPixel = isMobile ? 1 : 2;
+  let reflectionCount = isMobile ? 1 : 2;
   let renderDistance = 150;
   let debugHighlight = false;
   let debugColor = [1, 0, 1];
@@ -662,6 +671,16 @@ async function main() {
     reflectionCountVal.textContent = String(reflectionCount);
     frameIndex = 0;
   });
+
+  if (isMobile) {
+    raysPerPixelInput.max = '3';
+    raysPerPixelInput.value = String(raysPerPixel);
+    raysPerPixelVal.textContent = String(raysPerPixel);
+    reflectionCountInput.max = '3';
+    reflectionCountInput.value = String(reflectionCount);
+    reflectionCountVal.textContent = String(reflectionCount);
+    document.getElementById('mobileNote').style.display = '';
+  }
 
   const renderDistanceInput = document.getElementById('renderDistance');
   const renderDistanceVal = document.getElementById('renderDistanceVal');
