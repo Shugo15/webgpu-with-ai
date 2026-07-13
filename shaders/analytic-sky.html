@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>空(大気散乱の高速近似) - WebGPU Shader Playground</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    display: block;
+    width: min(100vw, 100vh);
+    height: min(100vw, 100vh);
+  }
+  #back {
+    position: fixed;
+    top: 1rem;
+    left: 1rem;
+    z-index: 10;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.5);
+    font-family: system-ui, sans-serif;
+    font-size: 0.9rem;
+    text-decoration: none;
+    padding: 0.4rem 0.8rem;
+    border-radius: 6px;
+  }
+  #back:hover {
+    background: rgba(0, 0, 0, 0.75);
+  }
+  #error {
+    display: none;
+    position: fixed;
+    inset: 0;
+    color: #fff;
+    background: #111;
+    font-family: system-ui, sans-serif;
+    padding: 2rem;
+    box-sizing: border-box;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<a id="back" href="../index.html">&larr; 一覧に戻る</a>
+<canvas id="gpuCanvas"></canvas>
+<div id="error"></div>
+
+<script>
+// レイマーチングもモンテカルロ積分も行わず、1ピクセルにつき1回の閉じた式(analytic)だけで
+// 大気散乱っぽい空の色を近似する高速なシェーダー。ループがないのでノイズも収束待ちも無い。
+const shaderCode = /* wgsl */ `
+struct Uniforms {
+  iResolution: vec2<f32>,
+  iTime: f32,
+  _pad: f32,
+};
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0)
+  );
+  return vec4<f32>(pos[vertexIndex], 0.0, 1.0);
+}
+
+const PI: f32 = 3.14159265;
+
+fn rayleighPhase(cosTheta: f32) -> f32 {
+  return 3.0 / (16.0 * PI) * (1.0 + cosTheta * cosTheta);
+}
+
+fn miePhase(cosTheta: f32, g: f32) -> f32 {
+  let g2 = g * g;
+  let denom = 1.0 + g2 - 2.0 * g * cosTheta;
+  return (1.0 - g2) / (4.0 * PI * pow(max(denom, 1e-4), 1.5));
+}
+
+fn hash21(p: vec2<f32>) -> f32 {
+  var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+  p3 = p3 + dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+// 空気の層をどれだけ通過するか(光路長)を、水平線に近いほど長くなる
+// 単純な指数関数(1/仰角)で近似する。レイマーチングで積分せず一発の式で済ませるのが速さの肝。
+fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
+  let cosTheta = dot(dir, sunDir);
+
+  let rayleighCoeff = vec3<f32>(0.35, 0.6, 1.1);
+  let mieCoeff = 0.65;
+  let mieG = 0.78;
+
+  let sunVisibility = smoothstep(-0.12, 0.06, sunDir.y);
+
+  if (dir.y < 0.0) {
+    // 地面(水平線より下)は単純に霞んだ色から暗い地面色へブレンドするだけ
+    let hazeColor = vec3<f32>(0.55, 0.5, 0.45) * sunVisibility;
+    let groundColor = vec3<f32>(0.02, 0.02, 0.025);
+    return mix(hazeColor, groundColor, smoothstep(0.0, -0.25, dir.y));
+  }
+
+  // 視線方向の光路(長いほど大気を長く通って減衰する = 水平線に近いほど長い)
+  let viewElevation = max(dir.y, 0.02);
+  let viewExtinction = exp(-(1.0 / viewElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * 0.15);
+
+  // 太陽光自体が地表に届くまでに通ってきた光路(これが短波長=青を減衰させ、
+  // 夕焼けが赤くなる主因。視線方向の減衰だけでは色が付かないので別途必要)
+  let sunElevation = max(sunDir.y, 0.02);
+  let sunTransmittance = exp(-(1.0 / sunElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * 0.15);
+
+  let rayleighInscatter = rayleighCoeff * rayleighPhase(cosTheta);
+  let mieInscatter = vec3<f32>(mieCoeff) * miePhase(cosTheta, mieG);
+  let inscatter = (rayleighInscatter + mieInscatter) * viewExtinction * sunTransmittance;
+
+  var col = inscatter * sunVisibility * 12.0;
+
+  // 太陽本体(円盤)。色そのものもsunTransmittanceで夕焼け時に赤くなる
+  let sunDisc = smoothstep(0.9995, 0.9999, cosTheta) * sunVisibility;
+  col += sunTransmittance * sunDisc * 8.0;
+
+  // 夜: 星と、ほんのり夜の環境光
+  let night = 1.0 - sunVisibility;
+  let starField = step(0.997, hash21(floor(dir.xz * 400.0))) * hash21(dir.xy * 123.4);
+  col += vec3<f32>(starField) * night;
+  col += vec3<f32>(0.008, 0.012, 0.025) * night;
+
+  return col;
+}
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let res = uniforms.iResolution;
+  let ndc = (fragCoord.xy - 0.5 * res) / res.y;
+
+  // 固定カメラ(空を見上げる向き)
+  let forward = normalize(vec3<f32>(0.0, 0.35, -1.0));
+  let worldUp = vec3<f32>(0.0, 1.0, 0.0);
+  let right = normalize(cross(forward, worldUp));
+  let up = cross(right, forward);
+  let fov = 1.5;
+  let dir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
+
+  // 太陽は時間とともにゆっくり空を巡る(昼->夕焼け->夜->朝焼け->昼)
+  let sunAngle = uniforms.iTime * 0.15;
+  let sunDir = normalize(vec3<f32>(cos(sunAngle) * 0.35, sin(sunAngle), -0.9));
+
+  let color = skyColor(dir, sunDir);
+
+  // 簡易トーンマッピング + ガンマ補正
+  let mapped = color / (color + vec3<f32>(1.0));
+  let gamma = pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+  return vec4<f32>(gamma, 1.0);
+}
+`;
+
+async function main() {
+  const canvas = document.getElementById('gpuCanvas');
+
+  if (!navigator.gpu) {
+    showError('このブラウザはWebGPUに対応していません。\nChrome/Edge の最新版などでお試しください。');
+    return;
+  }
+
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    showError('WebGPUアダプタの取得に失敗しました。');
+    return;
+  }
+  const device = await adapter.requestDevice();
+  device.lost.then((info) => console.log('WebGPU device lost:', info.reason, info.message));
+
+  const context = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const size = Math.max(1, Math.floor(Math.min(window.innerWidth, window.innerHeight) * dpr));
+    canvas.width = size;
+    canvas.height = size;
+    context.configure({
+      device,
+      format,
+      alphaMode: 'opaque',
+    });
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  const shaderModule = device.createShaderModule({ code: shaderCode });
+
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module: shaderModule,
+      entryPoint: 'vs_main',
+    },
+    fragment: {
+      module: shaderModule,
+      entryPoint: 'fs_main',
+      targets: [{ format }],
+    },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  // Uniforms: iResolution(vec2f) + iTime(f32) + padding(f32) = 16 bytes
+  const uniformBuffer = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+  });
+
+  const uniformData = new Float32Array(4);
+  const startTime = performance.now();
+
+  function frame() {
+    const iTime = (performance.now() - startTime) / 1000;
+    uniformData[0] = canvas.width;
+    uniformData[1] = canvas.height;
+    uniformData[2] = iTime;
+    uniformData[3] = 0;
+    device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(3);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+function showError(message) {
+  const el = document.getElementById('error');
+  el.textContent = message;
+  el.style.display = 'block';
+}
+
+main().catch((err) => {
+  console.error(err);
+  showError('エラーが発生しました:\n' + err.message);
+});
+</script>
+</body>
+</html>
