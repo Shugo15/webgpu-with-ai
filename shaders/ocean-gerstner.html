@@ -218,9 +218,9 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 
   let ndc = (fragCoord.xy - 0.5 * res) / res.y;
 
-  // 固定カメラ(水面をやや見下ろす向き)
+  // 固定カメラ(水平方向を向く)
   let eye = vec3<f32>(0.0, 2.5, 0.0);
-  let forward = normalize(vec3<f32>(0.0, -0.2, -1.0));
+  let forward = vec3<f32>(0.0, 0.0, -1.0);
   let worldUp = vec3<f32>(0.0, 1.0, 0.0);
   let right = normalize(cross(forward, worldUp));
   let up = cross(right, forward);
