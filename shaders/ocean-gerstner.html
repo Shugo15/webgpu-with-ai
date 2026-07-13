@@ -121,6 +121,11 @@
     <span class="val" id="roughnessVal">0.10</span>
   </div>
   <div class="row">
+    <label for="whitecapThreshold">白波の閾値</label>
+    <input id="whitecapThreshold" type="range" min="1" max="100" step="1" value="12">
+    <span class="val" id="whitecapThresholdVal">1.2</span>
+  </div>
+  <div class="row">
     <label for="raysPerPixel">レイ数/pixel</label>
     <input id="raysPerPixel" type="range" min="1" max="8" step="1" value="2">
     <span class="val" id="raysPerPixelVal">2</span>
@@ -185,7 +190,7 @@ struct Uniforms {
   params: vec4<f32>,     // x = maxBounces, y = debugMode(0/1), z = 描画距離(maxDist), w = frameIndex
   debugColor: vec4<f32>, // rgb = 強調表示の色, aは未使用
   waterColor: vec4<f32>, // rgb = フレネル透過成分の色(水そのものの色), aは未使用
-  params2: vec4<f32>,    // x = raysPerPixel, y = roughness(matte度合い), z/w未使用
+  params2: vec4<f32>,    // x = raysPerPixel, y = roughness(matte度合い), z = 白波の閾値, w未使用
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var prevTex: texture_2d<f32>;
@@ -257,12 +262,23 @@ fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
 
 const NUM_WAVES: u32 = 8u;
 
-// ガーストナー波(トロコイド波)の法線"と"実際の高さ(垂直変位)を1回のループで
-// まとめて求める。戻り値はxyz=法線, w=高さ。
+struct WaveSample {
+  normal: vec3<f32>,
+  height: f32,
+  laplacian: f32, // 曲率(∂²h/∂x²+∂²h/∂z²)。山で負、谷で正。白波の判定に使う
+};
+
+// ガーストナー波(トロコイド波)の法線・実際の高さ(垂直変位)・ラプラシアン(曲率)を
+// 1回のループでまとめて求める。
 // 波長・振幅が大きく異なる2つのグループを重ね合わせている: 前半3つは波長の長い
 // 大きなうねり、後半5つは波長の短い細かいさざ波。これにより大きい波のうねりの上に
 // 細かい波の輝き(グリント)が乗る、合成された見た目になる。
-fn gerstnerSample(pos: vec2<f32>, time: f32) -> vec4<f32> {
+//
+// ラプラシアンは有限差分(隣接点を追加サンプリング)せずに解析的に求めている。
+// 1つの波 amp*sin(k*dot(dir,pos)+ωt) の位置に対する2階微分は、方向dirが単位ベクトル
+// なので ∂²/∂x²+∂²/∂z² = -amp*k²*sin(θ) となり、ループ内で既に計算済みのsin(θ)を
+// そのまま使い回せるので追加コストはほぼゼロ。
+fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
   var dirs = array<vec2<f32>, 8>(
     // 大きなうねり
     normalize(vec2<f32>(1.0, 0.0)),
@@ -284,6 +300,7 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> vec4<f32> {
   var sumDz = 0.0;
   var sumY = 0.0;
   var height = 0.0;
+  var laplacian = 0.0;
 
   for (var i = 0u; i < NUM_WAVES; i = i + 1u) {
     let dir = dirs[i];
@@ -299,10 +316,26 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> vec4<f32> {
     sumDz += dir.y * k * amp * c;
     sumY += q * k * amp * s;
     height += amp * s;
+    laplacian += -amp * k * k * s;
   }
 
   let normal = normalize(vec3<f32>(-sumDx, 1.0 - sumY, -sumDz));
-  return vec4<f32>(normal, height);
+  return WaveSample(normal, height, laplacian);
+}
+
+// 波の山(とんがっていて、かつ急な部分)を白波として検出する係数(0〜1)を返す。
+// ラプラシアンの負の部分(=凸な山)だけを拾い、法線の傾き(1-normal.y、急なほど大きい)を
+// 掛け合わせることで、「尖っていて、かつ急」なところだけが白波になるようにしている。
+// smoothstepで滑らかにし、hash21による小さなノイズで泡のムラを付ける。
+fn whitecapFactor(pos: vec2<f32>, sample: WaveSample, threshold: f32) -> f32 {
+  let crestSharpness = max(-sample.laplacian, 0.0);
+  let steepness = 1.0 - sample.normal.y;
+  let signal = crestSharpness * steepness;
+
+  var foam = smoothstep(threshold * 0.7, threshold * 1.3, signal);
+  let foamNoise = hash21(floor(pos * 8.0));
+  foam *= mix(0.6, 1.0, foamNoise);
+  return foam;
 }
 
 // レイと実際の波面(高さフィールド)の交差点を、区間探索+二分探索で求める。
@@ -326,7 +359,7 @@ fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32, maxDist: f32) -> vec4
   let steps = nearSteps + farSteps;
 
   var t0 = 0.0;
-  var f0 = ro.y - gerstnerSample(ro.xz, time).w;
+  var f0 = ro.y - gerstnerSample(ro.xz, time).height;
 
   for (var i = 0u; i < steps; i = i + 1u) {
     var dt = nearStep;
@@ -335,7 +368,7 @@ fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32, maxDist: f32) -> vec4
     }
     let t1 = t0 + dt;
     let p1 = ro + rd * t1;
-    let f1 = p1.y - gerstnerSample(p1.xz, time).w;
+    let f1 = p1.y - gerstnerSample(p1.xz, time).height;
 
     if (f0 > 0.0 && f1 <= 0.0) {
       // この区間内で波面と交差した -> 二分探索で精密化
@@ -345,7 +378,7 @@ fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32, maxDist: f32) -> vec4
       for (var j = 0u; j < 8u; j = j + 1u) {
         let mid = 0.5 * (lo + hi);
         let pm = ro + rd * mid;
-        let fm = pm.y - gerstnerSample(pm.xz, time).w;
+        let fm = pm.y - gerstnerSample(pm.xz, time).height;
         if ((fLo > 0.0) == (fm > 0.0)) {
           lo = mid;
           fLo = fm;
@@ -389,6 +422,8 @@ struct OceanTraceResult {
   color: vec3<f32>,
   firstNormal: vec3<f32>, // フレネル計算用(最初にカメラのレイが水面に当たった点の法線)
   hitWater: f32,          // カメラのレイがそもそも水面に交差したか(1.0/0.0)
+  firstLaplacian: f32,    // 白波判定用(最初にカメラのレイが水面に当たった点の曲率)
+  firstPosXZ: vec2<f32>,  // 白波判定用(同、水平座標。ノイズのサンプリングに使う)
 };
 
 // 実際の波面との交差点をレイマーチングで求めながら反射を繰り返す(1回目の反射も含めて
@@ -399,20 +434,25 @@ fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f3
   var dir = rayDir;
   var ro = rayOrigin;
   var firstNormal = vec3<f32>(0.0, 1.0, 0.0);
+  var firstLaplacian = 0.0;
+  var firstPosXZ = vec2<f32>(0.0, 0.0);
 
   for (var i = 0u; i < maxBounces; i = i + 1u) {
     let hit = intersectWater(ro, dir, iTime, maxDist);
     if (hit.w < 0.5) {
       if (i == 0u) {
         // カメラのレイがそもそも水面に交差しなかった(極端に浅い角度) -> 空とみなす
-        return OceanTraceResult(skyColor(dir, sunDir), vec3<f32>(0.0, 1.0, 0.0), 0.0);
+        return OceanTraceResult(skyColor(dir, sunDir), vec3<f32>(0.0, 1.0, 0.0), 0.0, 0.0, vec2<f32>(0.0, 0.0));
       }
-      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0);
+      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0, firstLaplacian, firstPosXZ);
     }
     let hitPos = hit.xyz;
-    let n = gerstnerSample(hitPos.xz, iTime).xyz;
+    let wave = gerstnerSample(hitPos.xz, iTime);
+    let n = wave.normal;
     if (i == 0u) {
       firstNormal = n;
+      firstLaplacian = wave.laplacian;
+      firstPosXZ = hitPos.xz;
     }
 
     let idealReflect = reflect(dir, n);
@@ -425,7 +465,7 @@ fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f3
     ro = hitPos + n * 0.01;
 
     if (dir.y >= -0.0005) {
-      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0);
+      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0, firstLaplacian, firstPosXZ);
     }
   }
 
@@ -434,7 +474,7 @@ fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f3
   if (uniforms.params.y > 0.5) {
     fallback = uniforms.debugColor.rgb;
   }
-  return OceanTraceResult(fallback, firstNormal, 1.0);
+  return OceanTraceResult(fallback, firstNormal, 1.0, firstLaplacian, firstPosXZ);
 }
 
 @fragment
@@ -448,6 +488,7 @@ fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let frameIndex = uniforms.params.w;
   let raysPerPixel = u32(uniforms.params2.x);
   let roughness = uniforms.params2.y;
+  let whitecapThreshold = uniforms.params2.z;
 
   // 固定カメラ(水平方向を向く)
   let eye = vec3<f32>(0.0, 2.5, 0.0);
@@ -488,7 +529,15 @@ fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
         // 太陽が沈んでいれば水中に届く光が無いので、可視度で明るさを掛けて夜は暗くする。
         let sunVisibility = sunVisibilityOf(sunDir);
         let transmissionColor = uniforms.waterColor.rgb * sunVisibility;
-        sampleColor = mix(transmissionColor, result.color, fresnel);
+        var waterColorResult = mix(transmissionColor, result.color, fresnel);
+
+        // 白波: 尖っていて(ラプラシアンの山側)、かつ急な(法線の傾き)ところを白くする
+        let firstWave = WaveSample(result.firstNormal, 0.0, result.firstLaplacian);
+        let foam = whitecapFactor(result.firstPosXZ, firstWave, whitecapThreshold) * sunVisibility;
+        let foamColor = vec3<f32>(1.4, 1.4, 1.4); // 泡は太陽光をそのまま拡散反射するイメージで明るめ
+        waterColorResult = mix(waterColorResult, foamColor, foam);
+
+        sampleColor = waterColorResult;
       }
     }
     colorSum += sampleColor;
@@ -629,6 +678,7 @@ async function main() {
   // デフォルトと上限を下げて負荷を抑える(描画距離はステップ数が固定なので負荷に影響しない)。
   let sunHour = 10.0;
   let roughness = 0.10;
+  let whitecapThreshold = 1.2;
   let raysPerPixel = isMobile ? 1 : 2;
   let reflectionCount = isMobile ? 1 : 2;
   let renderDistance = 150;
@@ -653,6 +703,14 @@ async function main() {
   roughnessInput.addEventListener('input', () => {
     roughness = parseInt(roughnessInput.value, 10) / 100;
     roughnessVal.textContent = roughness.toFixed(2);
+    frameIndex = 0;
+  });
+
+  const whitecapThresholdInput = document.getElementById('whitecapThreshold');
+  const whitecapThresholdVal = document.getElementById('whitecapThresholdVal');
+  whitecapThresholdInput.addEventListener('input', () => {
+    whitecapThreshold = parseInt(whitecapThresholdInput.value, 10) / 10;
+    whitecapThresholdVal.textContent = whitecapThreshold.toFixed(1);
     frameIndex = 0;
   });
 
@@ -763,7 +821,7 @@ async function main() {
     uniformData[15] = 0;
     uniformData[16] = raysPerPixel;
     uniformData[17] = roughness;
-    uniformData[18] = 0;
+    uniformData[18] = whitecapThreshold;
     uniformData[19] = 0;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
