@@ -202,10 +202,12 @@ fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
 
 const NUM_WAVES: u32 = 5u;
 
-// ガーストナー波(トロコイド波)の法線を解析的に求める。
-// 高さ自体は使わず(水平な基準面との交点をそのまま反射点として使う近似)、
-// 反射の向きを決めるための法線だけを計算するので波ごとにループを回すだけで済む。
-fn gerstnerNormal(pos: vec2<f32>, time: f32) -> vec3<f32> {
+// ガーストナー波(トロコイド波)の法線"と"実際の高さ(垂直変位)を1回のループで
+// まとめて求める。戻り値はxyz=法線, w=高さ。
+// (以前は法線しか計算しておらず、水平な基準面との交点をそのまま反射点として
+// 使う近似だったため、正しい交差判定ができなかった。高さが分かれば
+// レイと波面の交差点をきちんと探索できる。)
+fn gerstnerSample(pos: vec2<f32>, time: f32) -> vec4<f32> {
   var dirs = array<vec2<f32>, 5>(
     normalize(vec2<f32>(1.0, 0.0)),
     normalize(vec2<f32>(0.6, 0.8)),
@@ -221,6 +223,7 @@ fn gerstnerNormal(pos: vec2<f32>, time: f32) -> vec3<f32> {
   var sumDx = 0.0;
   var sumDz = 0.0;
   var sumY = 0.0;
+  var height = 0.0;
 
   for (var i = 0u; i < NUM_WAVES; i = i + 1u) {
     let dir = dirs[i];
@@ -235,35 +238,100 @@ fn gerstnerNormal(pos: vec2<f32>, time: f32) -> vec3<f32> {
     sumDx += dir.x * k * amp * c;
     sumDz += dir.y * k * amp * c;
     sumY += q * k * amp * s;
+    height += amp * s;
   }
 
-  return normalize(vec3<f32>(-sumDx, 1.0 - sumY, -sumDz));
+  let normal = normalize(vec3<f32>(-sumDx, 1.0 - sumY, -sumDz));
+  return vec4<f32>(normal, height);
 }
 
-// 波の斜面で反射した先がまた下向き(=水面自身)になってしまう場合、
-// 平面近似では同じ交点に戻ってしまい交差計算ができないため、反射方向沿いに
-// 少しだけ水平移動した先でガーストナー法線を再サンプリングし、そこでもう一度
-// 反射する、を反射回数の上限まで繰り返す近似。現実には波の谷から別の波を
-// 反射で見ている状況に相当する。
-fn traceOceanReflection(rayDir: vec3<f32>, hitXZ: vec2<f32>, sunDir: vec3<f32>, iTime: f32, maxBounces: u32) -> vec3<f32> {
+// レイと実際の波面(高さフィールド)の交差点を、区間探索+二分探索で求める。
+// 戻り値はxyz=交差点の座標, w=見つかったら1.0/見つからなければ0.0。
+fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32) -> vec4<f32> {
+  if (rd.y >= -0.0001) {
+    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+  }
+
+  let maxDist = 40.0;
+  let steps = 24u;
+  let dt = maxDist / f32(steps);
+
+  var t0 = 0.0;
+  var f0 = ro.y - gerstnerSample(ro.xz, time).w;
+
+  for (var i = 0u; i < steps; i = i + 1u) {
+    let t1 = t0 + dt;
+    let p1 = ro + rd * t1;
+    let f1 = p1.y - gerstnerSample(p1.xz, time).w;
+
+    if (f0 > 0.0 && f1 <= 0.0) {
+      // この区間内で波面と交差した -> 二分探索で精密化
+      var lo = t0;
+      var hi = t1;
+      var fLo = f0;
+      for (var j = 0u; j < 8u; j = j + 1u) {
+        let mid = 0.5 * (lo + hi);
+        let pm = ro + rd * mid;
+        let fm = pm.y - gerstnerSample(pm.xz, time).w;
+        if ((fLo > 0.0) == (fm > 0.0)) {
+          lo = mid;
+          fLo = fm;
+        } else {
+          hi = mid;
+        }
+      }
+      let tHit = 0.5 * (lo + hi);
+      return vec4<f32>(ro + rd * tHit, 1.0);
+    }
+
+    t0 = t1;
+    f0 = f1;
+  }
+
+  return vec4<f32>(0.0, 0.0, 0.0, 0.0); // 探索範囲内で波面が見つからなかった
+}
+
+struct OceanTraceResult {
+  color: vec3<f32>,
+  firstNormal: vec3<f32>, // フレネル計算用(最初にカメラのレイが水面に当たった点の法線)
+  hitWater: f32,          // カメラのレイがそもそも水面に交差したか(1.0/0.0)
+};
+
+// 実際の波面との交差点をレイマーチングで求めながら反射を繰り返す(1回目の反射も含めて
+// 反射回数としてカウントする)。上限まで繰り返しても交差点が見つからない(=十分遠くまで
+// 波が無い、ほぼ水平に近い方向へ反射していった)場合は空とみなす。
+fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f32>, iTime: f32, maxBounces: u32) -> OceanTraceResult {
   var dir = rayDir;
-  var posXZ = hitXZ;
-  let bounceStep = 0.6;
+  var ro = rayOrigin;
+  var firstNormal = vec3<f32>(0.0, 1.0, 0.0);
 
   for (var i = 0u; i < maxBounces; i = i + 1u) {
-    let n = gerstnerNormal(posXZ, iTime);
-    dir = reflect(dir, n);
-    if (dir.y >= -0.0005) {
-      return skyColor(dir, sunDir);
+    let hit = intersectWater(ro, dir, iTime);
+    if (hit.w < 0.5) {
+      if (i == 0u) {
+        // カメラのレイがそもそも水面に交差しなかった(極端に浅い角度) -> 空とみなす
+        return OceanTraceResult(skyColor(dir, sunDir), vec3<f32>(0.0, 1.0, 0.0), 0.0);
+      }
+      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0);
     }
-    posXZ = posXZ + normalize(dir.xz) * bounceStep;
+    let hitPos = hit.xyz;
+    let n = gerstnerSample(hitPos.xz, iTime).xyz;
+    if (i == 0u) {
+      firstNormal = n;
+    }
+    dir = reflect(dir, n);
+    ro = hitPos + n * 0.01;
+    if (dir.y >= -0.0005) {
+      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0);
+    }
   }
 
-  // 反射回数を使い切っても下向きのまま = 波の谷が深すぎて水面近似が破綻したケース
+  // 反射回数を使い切っても下向きのまま = 波が深すぎて交差点が見つからなかったケース
+  var fallback = vec3<f32>(0.02, 0.05, 0.08); // 水面が水面自身を映す、それらしい暗い水色
   if (uniforms.params.y > 0.5) {
-    return uniforms.debugColor.rgb;
+    fallback = uniforms.debugColor.rgb;
   }
-  return vec3<f32>(0.02, 0.05, 0.08); // 水面が水面自身を映す、それらしい暗い水色
+  return OceanTraceResult(fallback, firstNormal, 1.0);
 }
 
 @fragment
@@ -294,19 +362,20 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     // 水平線より上 -> 空をそのまま見る
     color = skyColor(rayDir, sunDir);
   } else {
-    // 水平な基準面(y=0)との交点(x,z)を求め、そこから反射回数の上限まで反射を試みる
-    let t = -eye.y / rayDir.y;
-    let hitXZ = eye.xz + rayDir.xz * t;
-    let firstNormal = gerstnerNormal(hitXZ, iTime);
-    let reflectionColor = traceOceanReflection(rayDir, hitXZ, sunDir, iTime, maxBounces);
+    // 実際の波面とレイマーチングで交差判定を行い、反射回数の上限まで反射を試みる
+    let result = traceOceanReflection(rayDir, eye, sunDir, iTime, maxBounces);
 
-    // Fresnel(Schlick近似): 真上から見ると水色(透過)が主体、視線が水平に近づくほど反射が支配的になる
-    let viewDir = -rayDir;
-    let cosTheta = max(dot(viewDir, firstNormal), 0.0);
-    let f0 = 0.02; // 空気->水の垂直入射反射率(屈折率1.33相当)
-    let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+    if (result.hitWater < 0.5) {
+      color = result.color; // 交差点が見つからなかった(=空とみなす)
+    } else {
+      // Fresnel(Schlick近似): 真上から見ると水色(透過)が主体、視線が水平に近づくほど反射が支配的になる
+      let viewDir = -rayDir;
+      let cosTheta = max(dot(viewDir, result.firstNormal), 0.0);
+      let f0 = 0.02; // 空気->水の垂直入射反射率(屈折率1.33相当)
+      let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
 
-    color = mix(uniforms.waterColor.rgb, reflectionColor, fresnel);
+      color = mix(uniforms.waterColor.rgb, result.color, fresnel);
+    }
   }
 
   let mapped = color / (color + vec3<f32>(1.0));
