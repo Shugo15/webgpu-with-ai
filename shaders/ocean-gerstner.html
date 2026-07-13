@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>海(ガーストナー波・鏡面反射) - WebGPU Shader Playground</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    display: block;
+    width: min(100vw, 100vh);
+    height: min(100vw, 100vh);
+  }
+  #back {
+    position: fixed;
+    top: 1rem;
+    left: 1rem;
+    z-index: 10;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.5);
+    font-family: system-ui, sans-serif;
+    font-size: 0.9rem;
+    text-decoration: none;
+    padding: 0.4rem 0.8rem;
+    border-radius: 6px;
+  }
+  #back:hover {
+    background: rgba(0, 0, 0, 0.75);
+  }
+  #panel {
+    position: fixed;
+    top: 1rem;
+    right: 1rem;
+    z-index: 10;
+    color: #eee;
+    background: rgba(0, 0, 0, 0.55);
+    font-family: system-ui, sans-serif;
+    font-size: 0.8rem;
+    padding: 0.8rem 1rem;
+    border-radius: 8px;
+    min-width: 220px;
+  }
+  #panel .row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  #panel label {
+    flex: 1;
+  }
+  #panel input[type="range"] {
+    flex: 1;
+  }
+  #panel .val {
+    width: 3.5em;
+    text-align: right;
+  }
+  #error {
+    display: none;
+    position: fixed;
+    inset: 0;
+    color: #fff;
+    background: #111;
+    font-family: system-ui, sans-serif;
+    padding: 2rem;
+    box-sizing: border-box;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<a id="back" href="../index.html">&larr; 一覧に戻る</a>
+<div id="panel">
+  <div class="row">
+    <label for="sunHour">太陽の時刻</label>
+    <input id="sunHour" type="range" min="0" max="24" step="0.1" value="10">
+    <span class="val" id="sunHourVal">10:00</span>
+  </div>
+</div>
+<canvas id="gpuCanvas"></canvas>
+<div id="error"></div>
+
+<script>
+// 海面をガーストナー波(トロコイド変位)で表現し、透過なしの鏡面反射として
+// 空の色(前回の大気散乱近似と同じモデル)を映り込ませるだけのシンプルな海。
+// レイマーチングはせず、水平な基準面との交点(x,z)でガーストナー法線を解析的に
+// 求めて反射方向を決めるので、こちらも1ピクセル1回の計算で済む高速な近似。
+const shaderCode = /* wgsl */ `
+struct Uniforms {
+  resAndTime: vec4<f32>, // xy = resolution, z = iTime(波のアニメーションのみ), w = sunHour(太陽の時刻)
+};
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0)
+  );
+  return vec4<f32>(pos[vertexIndex], 0.0, 1.0);
+}
+
+const PI: f32 = 3.14159265;
+
+fn rayleighPhase(cosTheta: f32) -> f32 {
+  return 3.0 / (16.0 * PI) * (1.0 + cosTheta * cosTheta);
+}
+
+fn miePhase(cosTheta: f32, g: f32) -> f32 {
+  let g2 = g * g;
+  let denom = 1.0 + g2 - 2.0 * g * cosTheta;
+  return (1.0 - g2) / (4.0 * PI * pow(max(denom, 1e-4), 1.5));
+}
+
+fn hash21(p: vec2<f32>) -> f32 {
+  var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+  p3 = p3 + dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+// 空気の層をどれだけ通過するか(光路長)を、水平線に近いほど長くなる
+// 単純な指数関数(1/仰角)で近似する(shaders/analytic-sky.htmlと同じモデル)。
+fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
+  let cosTheta = dot(dir, sunDir);
+
+  let rayleighCoeff = vec3<f32>(0.1, 0.5, 2.0);
+  let mieCoeff = 0.12;
+  let mieG = 0.82;
+  let opticalScale = 0.15;
+
+  let sunVisibility = smoothstep(-0.12, 0.06, sunDir.y);
+
+  if (dir.y < 0.0) {
+    let hazeColor = vec3<f32>(0.55, 0.5, 0.45) * sunVisibility;
+    let groundColor = vec3<f32>(0.02, 0.02, 0.025);
+    return mix(hazeColor, groundColor, smoothstep(0.0, -0.25, dir.y));
+  }
+
+  let viewElevation = max(dir.y, 0.02);
+  let viewExtinction = exp(-(1.0 / viewElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * opticalScale);
+
+  let sunElevation = max(sunDir.y, 0.02);
+  let sunTransmittance = exp(-(1.0 / sunElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * opticalScale);
+
+  let rayleighInscatter = rayleighCoeff * rayleighPhase(cosTheta);
+  let mieInscatter = vec3<f32>(mieCoeff) * miePhase(cosTheta, mieG);
+  let inscatter = (rayleighInscatter + mieInscatter) * viewExtinction * sunTransmittance;
+
+  var col = inscatter * sunVisibility * 10.0;
+
+  let sunDisc = smoothstep(0.9995, 0.9999, cosTheta) * sunVisibility;
+  col += sunTransmittance * sunDisc * 8.0;
+
+  let night = 1.0 - sunVisibility;
+  let starField = step(0.997, hash21(floor(dir.xz * 400.0))) * hash21(dir.xy * 123.4);
+  col += vec3<f32>(starField) * night;
+  col += vec3<f32>(0.008, 0.012, 0.025) * night;
+
+  return col;
+}
+
+const NUM_WAVES: u32 = 5u;
+
+// ガーストナー波(トロコイド波)の法線を解析的に求める。
+// 高さ自体は使わず(水平な基準面との交点をそのまま反射点として使う近似)、
+// 反射の向きを決めるための法線だけを計算するので波ごとにループを回すだけで済む。
+fn gerstnerNormal(pos: vec2<f32>, time: f32) -> vec3<f32> {
+  var dirs = array<vec2<f32>, 5>(
+    normalize(vec2<f32>(1.0, 0.0)),
+    normalize(vec2<f32>(0.6, 0.8)),
+    normalize(vec2<f32>(-0.5, 0.87)),
+    normalize(vec2<f32>(0.3, -0.95)),
+    normalize(vec2<f32>(-0.8, -0.55)),
+  );
+  var wavelengths = array<f32, 5>(6.0, 3.6, 2.4, 1.5, 0.9);
+  var amplitudes = array<f32, 5>(0.3, 0.18, 0.10, 0.055, 0.03);
+
+  let qGlobal = 0.9; // トロコイドが尖りすぎない(自己交差しない)ように抑える全体の急峻さ
+
+  var sumDx = 0.0;
+  var sumDz = 0.0;
+  var sumY = 0.0;
+
+  for (var i = 0u; i < NUM_WAVES; i = i + 1u) {
+    let dir = dirs[i];
+    let k = 2.0 * PI / wavelengths[i];
+    let amp = amplitudes[i];
+    let omega = sqrt(9.8 * k);
+    let q = qGlobal / (k * amp * f32(NUM_WAVES));
+    let theta = k * dot(dir, pos) + omega * time;
+    let c = cos(theta);
+    let s = sin(theta);
+
+    sumDx += dir.x * k * amp * c;
+    sumDz += dir.y * k * amp * c;
+    sumY += q * k * amp * s;
+  }
+
+  return normalize(vec3<f32>(-sumDx, 1.0 - sumY, -sumDz));
+}
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let res = uniforms.resAndTime.xy;
+  let iTime = uniforms.resAndTime.z;
+  let sunHour = uniforms.resAndTime.w;
+
+  let ndc = (fragCoord.xy - 0.5 * res) / res.y;
+
+  // 固定カメラ(水面をやや見下ろす向き)
+  let eye = vec3<f32>(0.0, 2.5, 0.0);
+  let forward = normalize(vec3<f32>(0.0, -0.2, -1.0));
+  let worldUp = vec3<f32>(0.0, 1.0, 0.0);
+  let right = normalize(cross(forward, worldUp));
+  let up = cross(right, forward);
+  let fov = 1.5;
+  let rayDir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
+
+  // 太陽の向きは時間では動かさず、時刻スライダーの値だけで決める
+  let sunAngle = (sunHour - 6.0) / 12.0 * PI;
+  let sunDir = normalize(vec3<f32>(cos(sunAngle) * 0.35, sin(sunAngle), -0.9));
+
+  var color: vec3<f32>;
+  if (rayDir.y >= -0.0005) {
+    // 水平線より上 -> 空をそのまま見る
+    color = skyColor(rayDir, sunDir);
+  } else {
+    // 水平な基準面(y=0)との交点(x,z)でガーストナー法線を求め、そこで反射する
+    let t = -eye.y / rayDir.y;
+    let hitXZ = eye.xz + rayDir.xz * t;
+    let n = gerstnerNormal(hitXZ, iTime);
+    let reflected = reflect(rayDir, n);
+    color = skyColor(reflected, sunDir);
+  }
+
+  let mapped = color / (color + vec3<f32>(1.0));
+  let gamma = pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+  return vec4<f32>(gamma, 1.0);
+}
+`;
+
+async function main() {
+  const canvas = document.getElementById('gpuCanvas');
+
+  if (!navigator.gpu) {
+    showError('このブラウザはWebGPUに対応していません。\nChrome/Edge の最新版などでお試しください。');
+    return;
+  }
+
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    showError('WebGPUアダプタの取得に失敗しました。');
+    return;
+  }
+  const device = await adapter.requestDevice();
+  device.lost.then((info) => console.log('WebGPU device lost:', info.reason, info.message));
+
+  const context = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const size = Math.max(1, Math.floor(Math.min(window.innerWidth, window.innerHeight) * dpr));
+    canvas.width = size;
+    canvas.height = size;
+    context.configure({
+      device,
+      format,
+      alphaMode: 'opaque',
+    });
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  const shaderModule = device.createShaderModule({ code: shaderCode });
+
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module: shaderModule,
+      entryPoint: 'vs_main',
+    },
+    fragment: {
+      module: shaderModule,
+      entryPoint: 'fs_main',
+      targets: [{ format }],
+    },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  const uniformBuffer = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+  });
+
+  // UI: 太陽の時刻(バーで設定、デフォルト10:00)
+  let sunHour = 10.0;
+  const sunHourInput = document.getElementById('sunHour');
+  const sunHourVal = document.getElementById('sunHourVal');
+  function formatHour(h) {
+    const hh = Math.floor(h);
+    const mm = Math.round((h - hh) * 60);
+    return String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+  }
+  sunHourInput.addEventListener('input', () => {
+    sunHour = parseFloat(sunHourInput.value);
+    sunHourVal.textContent = formatHour(sunHour);
+  });
+
+  const uniformData = new Float32Array(4);
+  const startTime = performance.now();
+
+  function frame() {
+    const iTime = (performance.now() - startTime) / 1000;
+    uniformData[0] = canvas.width;
+    uniformData[1] = canvas.height;
+    uniformData[2] = iTime;
+    uniformData[3] = sunHour;
+    device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(3);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+function showError(message) {
+  const el = document.getElementById('error');
+  el.textContent = message;
+  el.style.display = 'block';
+}
+
+main().catch((err) => {
+  console.error(err);
+  showError('エラーが発生しました:\n' + err.message);
+});
+</script>
+</body>
+</html>
