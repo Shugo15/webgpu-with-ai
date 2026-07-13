@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>WebGPU Shader Playground</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+  }
+  #error {
+    display: none;
+    position: fixed;
+    inset: 0;
+    color: #fff;
+    background: #111;
+    font-family: system-ui, sans-serif;
+    padding: 2rem;
+    box-sizing: border-box;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="gpuCanvas"></canvas>
+<div id="error"></div>
+
+<script>
+// フルスクリーンの三角形1枚を描画し、フラグメントシェーダーで全画素を塗る最小構成。
+const shaderCode = /* wgsl */ `
+struct Uniforms {
+  iResolution: vec2<f32>,
+  iTime: f32,
+  _pad: f32,
+};
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0)
+  );
+  return vec4<f32>(pos[vertexIndex], 0.0, 1.0);
+}
+
+fn hsv2rgb(c: vec3<f32>) -> vec3<f32> {
+  let K = vec4<f32>(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  let p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, vec3<f32>(0.0), vec3<f32>(1.0)), c.y);
+}
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = fragCoord.xy / uniforms.iResolution;
+  let hue = fract(uv.x * 0.6 + uv.y * 0.4 + uniforms.iTime * 0.1);
+  let color = hsv2rgb(vec3<f32>(hue, 0.8, 1.0));
+  return vec4<f32>(color, 1.0);
+}
+`;
+
+async function main() {
+  const canvas = document.getElementById('gpuCanvas');
+
+  if (!navigator.gpu) {
+    showError('このブラウザはWebGPUに対応していません。\nChrome/Edge の最新版などでお試しください。');
+    return;
+  }
+
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    showError('WebGPUアダプタの取得に失敗しました。');
+    return;
+  }
+  const device = await adapter.requestDevice();
+  device.lost.then((info) => console.log('WebGPU device lost:', info.reason, info.message));
+
+  const context = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.floor(window.innerWidth * dpr));
+    canvas.height = Math.max(1, Math.floor(window.innerHeight * dpr));
+    context.configure({
+      device,
+      format,
+      alphaMode: 'opaque',
+    });
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  const shaderModule = device.createShaderModule({ code: shaderCode });
+
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module: shaderModule,
+      entryPoint: 'vs_main',
+    },
+    fragment: {
+      module: shaderModule,
+      entryPoint: 'fs_main',
+      targets: [{ format }],
+    },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  // Uniforms: iResolution(vec2f) + iTime(f32) + padding(f32) = 16 bytes
+  const uniformBuffer = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+  });
+
+  const uniformData = new Float32Array(4);
+  const startTime = performance.now();
+
+  function frame() {
+    const iTime = (performance.now() - startTime) / 1000;
+    uniformData[0] = canvas.width;
+    uniformData[1] = canvas.height;
+    uniformData[2] = iTime;
+    uniformData[3] = 0;
+    device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(3);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+function showError(message) {
+  const el = document.getElementById('error');
+  el.textContent = message;
+  el.style.display = 'block';
+}
+
+main().catch((err) => {
+  console.error(err);
+  showError('エラーが発生しました:\n' + err.message);
+});
+</script>
+</body>
+</html>
