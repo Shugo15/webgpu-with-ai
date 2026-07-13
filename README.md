@@ -2,6 +2,8 @@
 
 ビルド不要のバニラJS/HTMLで作ったWebGPUシェーダープレイグラウンドです。`index.html`を開くとシェーダー一覧のホームページが表示され、各リンクから個別のシェーダーページに遷移します。
 
+**デモ:** https://shugo15.github.io/webgpu-with-ai/
+
 ## 構成
 
 - `index.html` — シェーダー一覧のホームページ
