@@ -62,8 +62,16 @@ fn hsv2rgb(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
-  let uv = fragCoord.xy / uniforms.iResolution;
-  let hue = fract(uv.x * 0.6 + uv.y * 0.4 + uniforms.iTime * 0.1);
+  let aspect = uniforms.iResolution.x / uniforms.iResolution.y;
+  var uv = fragCoord.xy / uniforms.iResolution - vec2<f32>(0.5, 0.5);
+  uv.x *= aspect;
+
+  let angle = uniforms.iTime * 0.5;
+  let s = sin(angle);
+  let c = cos(angle);
+  let rotated = vec2<f32>(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
+
+  let hue = fract(rotated.x * 0.6 + rotated.y * 0.4 + uniforms.iTime * 0.1);
   let color = hsv2rgb(vec3<f32>(hue, 0.8, 1.0));
   return vec4<f32>(color, 1.0);
 }
