@@ -261,11 +261,15 @@ fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
 }
 
 const NUM_WAVES: u32 = 8u;
+const NUM_LARGE_WAVES: u32 = 3u; // 前半3つが大きなうねり(白波判定で「頂上付近か」の基準にする)
+const LARGE_WAVE_AMPLITUDE_SUM: f32 = 0.7; // 大きなうねり3つの振幅合計(0.35+0.22+0.13)
 
 struct WaveSample {
   normal: vec3<f32>,
   height: f32,
-  laplacian: f32, // 曲率(∂²h/∂x²+∂²h/∂z²)。山で負、谷で正。白波の判定に使う
+  laplacian: f32,   // 曲率(∂²h/∂x²+∂²h/∂z²)。山で負、谷で正。白波の判定に使う
+  largeHeight: f32, // 大きなうねりだけの高さ(細かいさざ波を含まない)。白波が頂上付近に
+                     // 集中するようにするための基準に使う
 };
 
 // ガーストナー波(トロコイド波)の法線・実際の高さ(垂直変位)・ラプラシアン(曲率)を
@@ -301,6 +305,7 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
   var sumY = 0.0;
   var height = 0.0;
   var laplacian = 0.0;
+  var largeHeight = 0.0;
 
   for (var i = 0u; i < NUM_WAVES; i = i + 1u) {
     let dir = dirs[i];
@@ -317,24 +322,39 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
     sumY += q * k * amp * s;
     height += amp * s;
     laplacian += -amp * k * k * s;
+    if (i < NUM_LARGE_WAVES) {
+      largeHeight += amp * s;
+    }
   }
 
   let normal = normalize(vec3<f32>(-sumDx, 1.0 - sumY, -sumDz));
-  return WaveSample(normal, height, laplacian);
+  return WaveSample(normal, height, laplacian, largeHeight);
 }
 
 // 波の山(とんがっていて、かつ急な部分)を白波として検出する係数(0〜1)を返す。
 // ラプラシアンの負の部分(=凸な山)だけを拾い、法線の傾き(1-normal.y、急なほど大きい)を
-// 掛け合わせることで、「尖っていて、かつ急」なところだけが白波になるようにしている。
+// 掛け合わせる。さらに、大きなうねり自体の頂上付近(largeHeightが高いところ)に近いほど
+// 強く出るようにする係数(crestProximity)も掛ける。現実の白波は細かい波が尖っていれば
+// どこでも砕けるわけではなく、大きい波のエネルギーが集まる頂上付近で砕けるため、これが無いと
+// うねりの稜線と無関係に斑点が散らばる不自然な見た目になる。
 // smoothstepで滑らかにし、hash21による小さなノイズで泡のムラを付ける。
-fn whitecapFactor(pos: vec2<f32>, sample: WaveSample, threshold: f32) -> f32 {
+fn whitecapFactor(pos: vec2<f32>, sample: WaveSample, threshold: f32, dist: f32) -> f32 {
   let crestSharpness = max(-sample.laplacian, 0.0);
   let steepness = 1.0 - sample.normal.y;
-  let signal = crestSharpness * steepness;
+
+  let crestProximity = smoothstep(0.05 * LARGE_WAVE_AMPLITUDE_SUM, 0.55 * LARGE_WAVE_AMPLITUDE_SUM, sample.largeHeight);
+
+  let signal = crestSharpness * steepness * crestProximity;
 
   var foam = smoothstep(threshold * 0.7, threshold * 1.3, signal);
   let foamNoise = hash21(floor(pos * 8.0));
   foam *= mix(0.6, 1.0, foamNoise);
+
+  // 遠方では波が細かすぎて画面上でモアレ状のエイリアシングになるため、
+  // 一定距離を超えたらフェードアウトさせる(遠くの細かい泡は元々見分けが付かないので妥当な近似)
+  let distanceFade = 1.0 - smoothstep(15.0, 30.0, dist);
+  foam *= distanceFade;
+
   return foam;
 }
 
@@ -420,10 +440,12 @@ fn randomUnitVector(seed: ptr<function, u32>) -> vec3<f32> {
 
 struct OceanTraceResult {
   color: vec3<f32>,
-  firstNormal: vec3<f32>, // フレネル計算用(最初にカメラのレイが水面に当たった点の法線)
-  hitWater: f32,          // カメラのレイがそもそも水面に交差したか(1.0/0.0)
-  firstLaplacian: f32,    // 白波判定用(最初にカメラのレイが水面に当たった点の曲率)
-  firstPosXZ: vec2<f32>,  // 白波判定用(同、水平座標。ノイズのサンプリングに使う)
+  firstNormal: vec3<f32>,  // フレネル計算用(最初にカメラのレイが水面に当たった点の法線)
+  hitWater: f32,           // カメラのレイがそもそも水面に交差したか(1.0/0.0)
+  firstLaplacian: f32,     // 白波判定用(最初にカメラのレイが水面に当たった点の曲率)
+  firstPosXZ: vec2<f32>,   // 白波判定用(同、水平座標。ノイズのサンプリングに使う)
+  firstLargeHeight: f32,   // 白波判定用(同、大きなうねりだけの高さ)
+  firstDist: f32,          // 白波判定用(カメラからの距離。遠方でのエイリアシングを抑えるため)
 };
 
 // 実際の波面との交差点をレイマーチングで求めながら反射を繰り返す(1回目の反射も含めて
@@ -433,18 +455,21 @@ struct OceanTraceResult {
 fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f32>, iTime: f32, maxBounces: u32, maxDist: f32, roughness: f32, seed: ptr<function, u32>) -> OceanTraceResult {
   var dir = rayDir;
   var ro = rayOrigin;
+  let cameraPos = rayOrigin;
   var firstNormal = vec3<f32>(0.0, 1.0, 0.0);
   var firstLaplacian = 0.0;
   var firstPosXZ = vec2<f32>(0.0, 0.0);
+  var firstLargeHeight = 0.0;
+  var firstDist = 0.0;
 
   for (var i = 0u; i < maxBounces; i = i + 1u) {
     let hit = intersectWater(ro, dir, iTime, maxDist);
     if (hit.w < 0.5) {
       if (i == 0u) {
         // カメラのレイがそもそも水面に交差しなかった(極端に浅い角度) -> 空とみなす
-        return OceanTraceResult(skyColor(dir, sunDir), vec3<f32>(0.0, 1.0, 0.0), 0.0, 0.0, vec2<f32>(0.0, 0.0));
+        return OceanTraceResult(skyColor(dir, sunDir), vec3<f32>(0.0, 1.0, 0.0), 0.0, 0.0, vec2<f32>(0.0, 0.0), 0.0, 0.0);
       }
-      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0, firstLaplacian, firstPosXZ);
+      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0, firstLaplacian, firstPosXZ, firstLargeHeight, firstDist);
     }
     let hitPos = hit.xyz;
     let wave = gerstnerSample(hitPos.xz, iTime);
@@ -453,6 +478,8 @@ fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f3
       firstNormal = n;
       firstLaplacian = wave.laplacian;
       firstPosXZ = hitPos.xz;
+      firstLargeHeight = wave.largeHeight;
+      firstDist = length(hitPos - cameraPos);
     }
 
     let idealReflect = reflect(dir, n);
@@ -465,7 +492,7 @@ fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f3
     ro = hitPos + n * 0.01;
 
     if (dir.y >= -0.0005) {
-      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0, firstLaplacian, firstPosXZ);
+      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0, firstLaplacian, firstPosXZ, firstLargeHeight, firstDist);
     }
   }
 
@@ -474,7 +501,7 @@ fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f3
   if (uniforms.params.y > 0.5) {
     fallback = uniforms.debugColor.rgb;
   }
-  return OceanTraceResult(fallback, firstNormal, 1.0, firstLaplacian, firstPosXZ);
+  return OceanTraceResult(fallback, firstNormal, 1.0, firstLaplacian, firstPosXZ, firstLargeHeight, firstDist);
 }
 
 @fragment
@@ -532,8 +559,8 @@ fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
         var waterColorResult = mix(transmissionColor, result.color, fresnel);
 
         // 白波: 尖っていて(ラプラシアンの山側)、かつ急な(法線の傾き)ところを白くする
-        let firstWave = WaveSample(result.firstNormal, 0.0, result.firstLaplacian);
-        let foam = whitecapFactor(result.firstPosXZ, firstWave, whitecapThreshold) * sunVisibility;
+        let firstWave = WaveSample(result.firstNormal, 0.0, result.firstLaplacian, result.firstLargeHeight);
+        let foam = whitecapFactor(result.firstPosXZ, firstWave, whitecapThreshold, result.firstDist) * sunVisibility;
         let foamColor = vec3<f32>(1.4, 1.4, 1.4); // 泡は太陽光をそのまま拡散反射するイメージで明るめ
         waterColorResult = mix(waterColorResult, foamColor, foam);
 
