@@ -88,6 +88,9 @@
   #panel button:hover {
     background: rgba(255, 255, 255, 0.2);
   }
+  #panel .samples {
+    color: #9c9;
+  }
   #error {
     display: none;
     position: fixed;
@@ -110,7 +113,17 @@
     <span class="val" id="sunHourVal">10:00</span>
   </div>
   <div class="row">
-    <button id="pauseButton" type="button">一時停止</button>
+    <button id="pauseButton" type="button">再生</button>
+  </div>
+  <div class="row">
+    <label for="roughness">水面の粗さ(matte)</label>
+    <input id="roughness" type="range" min="0" max="50" step="1" value="10">
+    <span class="val" id="roughnessVal">0.10</span>
+  </div>
+  <div class="row">
+    <label for="raysPerPixel">レイ数/pixel</label>
+    <input id="raysPerPixel" type="range" min="1" max="8" step="1" value="2">
+    <span class="val" id="raysPerPixelVal">2</span>
   </div>
   <div class="row">
     <label for="reflectionCount">反射回数</label>
@@ -134,24 +147,17 @@
     <label for="debugColor">強調表示の色</label>
     <input id="debugColor" type="color" value="#ff00ff">
   </div>
+  <div class="row">
+    <span>累積サンプル数</span>
+    <span class="samples" id="sampleCount">0</span>
+  </div>
 </div>
 <canvas id="gpuCanvas"></canvas>
 <div id="error"></div>
 
 <script>
-// 海面をガーストナー波(トロコイド変位)で表現し、透過なしの鏡面反射として
-// 空の色(前回の大気散乱近似と同じモデル)を映り込ませるだけのシンプルな海。
-// レイマーチングはせず、水平な基準面との交点(x,z)でガーストナー法線を解析的に
-// 求めて反射方向を決めるので、こちらも1ピクセル1回の計算で済む高速な近似。
-const shaderCode = /* wgsl */ `
-struct Uniforms {
-  resAndTime: vec4<f32>, // xy = resolution, z = iTime(波のアニメーションのみ), w = sunHour(太陽の時刻)
-  params: vec4<f32>,     // x = maxBounces, y = debugMode(0/1), z = 描画距離(maxDist), w未使用
-  debugColor: vec4<f32>, // rgb = 強調表示の色, aは未使用
-  waterColor: vec4<f32>, // rgb = フレネル透過成分の色(水そのものの色), aは未使用
-};
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
-
+// フルスクリーン三角形の頂点シェーダー(全モジュール共通)
+const vertexShaderCode = /* wgsl */ `
 @vertex
 fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
   var pos = array<vec2<f32>, 3>(
@@ -161,6 +167,25 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f
   );
   return vec4<f32>(pos[vertexIndex], 0.0, 1.0);
 }
+`;
+
+// 海面をガーストナー波(トロコイド変位)で表現し、空の色(前回の大気散乱近似と同じモデル)を
+// フレネル反射+透過色で描画する。現実の海は完全な鏡面ではなく少しmatteなので、反射方向を
+// 粗さ(roughness)に応じてランダムに散らす。これによりノイズが乗るため、波を一時停止した状態で
+// フレームを重ねて累積平均を取り(ping-pongさせた2枚のrgba16floatテクスチャ)、時間積分で
+// ノイズを収束させる。波が動いている間は毎フレーム新規描画になりノイズが乗ったままになる。
+const traceShaderCode = /* wgsl */ `
+${vertexShaderCode}
+
+struct Uniforms {
+  resAndTime: vec4<f32>, // xy = resolution, z = iTime(波のアニメーションのみ), w = sunHour(太陽の時刻)
+  params: vec4<f32>,     // x = maxBounces, y = debugMode(0/1), z = 描画距離(maxDist), w = frameIndex
+  debugColor: vec4<f32>, // rgb = 強調表示の色, aは未使用
+  waterColor: vec4<f32>, // rgb = フレネル透過成分の色(水そのものの色), aは未使用
+  params2: vec4<f32>,    // x = raysPerPixel, y = roughness(matte度合い), z/w未使用
+};
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(1) var prevTex: texture_2d<f32>;
 
 const PI: f32 = 3.14159265;
 
@@ -231,9 +256,6 @@ const NUM_WAVES: u32 = 5u;
 
 // ガーストナー波(トロコイド波)の法線"と"実際の高さ(垂直変位)を1回のループで
 // まとめて求める。戻り値はxyz=法線, w=高さ。
-// (以前は法線しか計算しておらず、水平な基準面との交点をそのまま反射点として
-// 使う近似だったため、正しい交差判定ができなかった。高さが分かれば
-// レイと波面の交差点をきちんと探索できる。)
 fn gerstnerSample(pos: vec2<f32>, time: f32) -> vec4<f32> {
   var dirs = array<vec2<f32>, 5>(
     normalize(vec2<f32>(1.0, 0.0)),
@@ -330,6 +352,27 @@ fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32, maxDist: f32) -> vec4
   return vec4<f32>(0.0, 0.0, 0.0, 0.0); // 探索範囲内で波面が見つからなかった
 }
 
+fn pcgHash(input: u32) -> u32 {
+  var state = input * 747796405u + 2891336453u;
+  var word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+fn rand(seed: ptr<function, u32>) -> f32 {
+  *seed = pcgHash(*seed);
+  return f32(*seed) / 4294967295.0;
+}
+
+// 単位球面上の一様なランダム方向(粗さによる反射のぼかしに使う)
+fn randomUnitVector(seed: ptr<function, u32>) -> vec3<f32> {
+  let r1 = rand(seed);
+  let r2 = rand(seed);
+  let z = 1.0 - 2.0 * r1;
+  let r = sqrt(max(0.0, 1.0 - z * z));
+  let phi = 6.2831853 * r2;
+  return vec3<f32>(r * cos(phi), r * sin(phi), z);
+}
+
 struct OceanTraceResult {
   color: vec3<f32>,
   firstNormal: vec3<f32>, // フレネル計算用(最初にカメラのレイが水面に当たった点の法線)
@@ -337,9 +380,10 @@ struct OceanTraceResult {
 };
 
 // 実際の波面との交差点をレイマーチングで求めながら反射を繰り返す(1回目の反射も含めて
-// 反射回数としてカウントする)。上限まで繰り返しても交差点が見つからない(=十分遠くまで
-// 波が無い、ほぼ水平に近い方向へ反射していった)場合は空とみなす。
-fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f32>, iTime: f32, maxBounces: u32, maxDist: f32) -> OceanTraceResult {
+// 反射回数としてカウントする)。反射方向は水面の粗さ(roughness)に応じてランダムに散らし、
+// 現実の海が完全な鏡面ではなく少しmatteであることを近似する。上限まで繰り返しても
+// 交差点が見つからない場合は空とみなす。
+fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f32>, iTime: f32, maxBounces: u32, maxDist: f32, roughness: f32, seed: ptr<function, u32>) -> OceanTraceResult {
   var dir = rayDir;
   var ro = rayOrigin;
   var firstNormal = vec3<f32>(0.0, 1.0, 0.0);
@@ -358,8 +402,16 @@ fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f3
     if (i == 0u) {
       firstNormal = n;
     }
-    dir = reflect(dir, n);
+
+    let idealReflect = reflect(dir, n);
+    var scattered = normalize(idealReflect + roughness * randomUnitVector(seed));
+    if (dot(scattered, n) < 0.0) {
+      // 法線の下(水面の中)に潜り込んでしまった分は鏡映しして上半球に戻す
+      scattered = scattered - 2.0 * dot(scattered, n) * n;
+    }
+    dir = scattered;
     ro = hitPos + n * 0.01;
+
     if (dir.y >= -0.0005) {
       return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0);
     }
@@ -374,12 +426,16 @@ fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f3
 }
 
 @fragment
-fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let res = uniforms.resAndTime.xy;
   let iTime = uniforms.resAndTime.z;
   let sunHour = uniforms.resAndTime.w;
 
-  let ndc = (fragCoord.xy - 0.5 * res) / res.y;
+  let maxBounces = u32(uniforms.params.x);
+  let renderDistance = uniforms.params.z;
+  let frameIndex = uniforms.params.w;
+  let raysPerPixel = u32(uniforms.params2.x);
+  let roughness = uniforms.params2.y;
 
   // 固定カメラ(水平方向を向く)
   let eye = vec3<f32>(0.0, 2.5, 0.0);
@@ -388,45 +444,62 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let right = normalize(cross(forward, worldUp));
   let up = cross(right, forward);
   let fov = 1.5;
-  let rayDir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
 
   // 太陽の向きは時間では動かさず、時刻スライダーの値だけで決める
   let sunAngle = (sunHour - 6.0) / 12.0 * PI;
   let sunDir = normalize(vec3<f32>(cos(sunAngle) * 0.35, sin(sunAngle), -0.9));
 
-  let maxBounces = u32(uniforms.params.x);
-  let renderDistance = uniforms.params.z;
+  let pixelIndex = u32(fragCoord.y) * u32(res.x) + u32(fragCoord.x);
+  var colorSum = vec3<f32>(0.0, 0.0, 0.0);
 
-  var color: vec3<f32>;
-  if (rayDir.y >= -0.0005) {
-    // 水平線より上 -> 空をそのまま見る
-    color = skyColor(rayDir, sunDir);
-  } else {
-    // 実際の波面とレイマーチングで交差判定を行い、反射回数の上限まで反射を試みる
-    let result = traceOceanReflection(rayDir, eye, sunDir, iTime, maxBounces, renderDistance);
+  for (var s: u32 = 0u; s < raysPerPixel; s = s + 1u) {
+    var seed = pixelIndex * 9781u + u32(frameIndex) * 6271u + s * 26699u + 1u;
+    let jitter = vec2<f32>(rand(&seed), rand(&seed)) - 0.5;
+    let ndc = ((fragCoord.xy + jitter) - 0.5 * res) / res.y;
+    let rayDir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
 
-    if (result.hitWater < 0.5) {
-      color = result.color; // 交差点が見つからなかった(=空とみなす)
+    var sampleColor: vec3<f32>;
+    if (rayDir.y >= -0.0005) {
+      sampleColor = skyColor(rayDir, sunDir);
     } else {
-      // Fresnel(Schlick近似): 真上から見ると水色(透過)が主体、視線が水平に近づくほど反射が支配的になる
-      let viewDir = -rayDir;
-      let cosTheta = max(dot(viewDir, result.firstNormal), 0.0);
-      let f0 = 0.02; // 空気->水の垂直入射反射率(屈折率1.33相当)
-      let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+      let result = traceOceanReflection(rayDir, eye, sunDir, iTime, maxBounces, renderDistance, roughness, &seed);
+      if (result.hitWater < 0.5) {
+        sampleColor = result.color;
+      } else {
+        // Fresnel(Schlick近似): 真上から見ると水色(透過)が主体、視線が水平に近づくほど反射が支配的になる
+        let viewDir = -rayDir;
+        let cosTheta = max(dot(viewDir, result.firstNormal), 0.0);
+        let f0 = 0.02; // 空気->水の垂直入射反射率(屈折率1.33相当)
+        let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
 
-      // 透過色(水そのものの色)は、深いところまで潜って戻ってきた光の色として
-      // 深さに依存しない一定の色に収束する(uniforms.waterColor、Pope & Fry (1997)の
-      // 純水吸収スペクトルに基づく比率をデフォルト値にしている)。ただし太陽が沈んでいれば
-      // そもそも水中に届く光が無いので、太陽の可視度(sunVisibilityOf)で明るさを掛けて
-      // 夜は暗く落ちるようにする。
-      let sunVisibility = sunVisibilityOf(sunDir);
-      let transmissionColor = uniforms.waterColor.rgb * sunVisibility;
-
-      color = mix(transmissionColor, result.color, fresnel);
+        // 透過色(水そのものの色)は深さに依存しない一定の色に収束する(waterColor)。
+        // 太陽が沈んでいれば水中に届く光が無いので、可視度で明るさを掛けて夜は暗くする。
+        let sunVisibility = sunVisibilityOf(sunDir);
+        let transmissionColor = uniforms.waterColor.rgb * sunVisibility;
+        sampleColor = mix(transmissionColor, result.color, fresnel);
+      }
     }
+    colorSum += sampleColor;
   }
+  let currentSample = colorSum / f32(raysPerPixel);
 
-  let mapped = color / (color + vec3<f32>(1.0));
+  let prev = textureLoad(prevTex, vec2<i32>(i32(fragCoord.x), i32(fragCoord.y)), 0).rgb;
+  let n = frameIndex + 1.0;
+  let newAvg = prev + (currentSample - prev) / n;
+  return vec4<f32>(newAvg, 1.0);
+}
+`;
+
+// 累積平均バッファをトーンマッピングしてcanvasへ表示するだけのパス
+const displayShaderCode = /* wgsl */ `
+${vertexShaderCode}
+
+@group(0) @binding(0) var avgTex: texture_2d<f32>;
+
+@fragment
+fn fs_display(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let c = textureLoad(avgTex, vec2<i32>(i32(fragCoord.x), i32(fragCoord.y)), 0).rgb;
+  let mapped = c / (c + vec3<f32>(1.0));
   let gamma = pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
   return vec4<f32>(gamma, 1.0);
 }
@@ -449,50 +522,96 @@ async function main() {
   device.lost.then((info) => console.log('WebGPU device lost:', info.reason, info.message));
 
   const context = canvas.getContext('webgpu');
-  const format = navigator.gpu.getPreferredCanvasFormat();
+  const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+  const accumFormat = 'rgba16float';
+
+  const traceModule = device.createShaderModule({ code: traceShaderCode });
+  const displayModule = device.createShaderModule({ code: displayShaderCode });
+
+  const tracePipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: traceModule, entryPoint: 'vs_main' },
+    fragment: { module: traceModule, entryPoint: 'fs_trace', targets: [{ format: accumFormat }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  const displayPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: displayModule, entryPoint: 'vs_main' },
+    fragment: { module: displayModule, entryPoint: 'fs_display', targets: [{ format: canvasFormat }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  const uniformBuffer = device.createBuffer({
+    size: 80,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  let texA = null, texB = null;
+  let viewA = null, viewB = null;
+  let traceBindGroupSrcA = null; // prevTex = A (Bへ書く)
+  let traceBindGroupSrcB = null; // prevTex = B (Aへ書く)
+  let displayBindGroupA = null;  // avgTex = A
+  let displayBindGroupB = null;  // avgTex = B
+  let frameIndex = 0;
+
+  function createAccumTextures(width, height) {
+    if (texA) texA.destroy();
+    if (texB) texB.destroy();
+    texA = device.createTexture({
+      size: [width, height],
+      format: accumFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    texB = device.createTexture({
+      size: [width, height],
+      format: accumFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    viewA = texA.createView();
+    viewB = texB.createView();
+
+    traceBindGroupSrcA = device.createBindGroup({
+      layout: tracePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 1, resource: viewA },
+      ],
+    });
+    traceBindGroupSrcB = device.createBindGroup({
+      layout: tracePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 1, resource: viewB },
+      ],
+    });
+    displayBindGroupA = device.createBindGroup({
+      layout: displayPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: viewA }],
+    });
+    displayBindGroupB = device.createBindGroup({
+      layout: displayPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: viewB }],
+    });
+  }
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
     const size = Math.max(1, Math.floor(Math.min(window.innerWidth, window.innerHeight) * dpr));
     canvas.width = size;
     canvas.height = size;
-    context.configure({
-      device,
-      format,
-      alphaMode: 'opaque',
-    });
+    context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+    createAccumTextures(size, size);
+    frameIndex = 0;
   }
   window.addEventListener('resize', resize);
   resize();
 
-  const shaderModule = device.createShaderModule({ code: shaderCode });
-
-  const pipeline = device.createRenderPipeline({
-    layout: 'auto',
-    vertex: {
-      module: shaderModule,
-      entryPoint: 'vs_main',
-    },
-    fragment: {
-      module: shaderModule,
-      entryPoint: 'fs_main',
-      targets: [{ format }],
-    },
-    primitive: { topology: 'triangle-list' },
-  });
-
-  const uniformBuffer = device.createBuffer({
-    size: 64,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
-  });
-
-  // UI: 太陽の時刻(バーで設定、デフォルト10:00) / 反射回数 / 失敗箇所の強調表示
+  // UI: 太陽の時刻 / 粗さ / レイ数 / 反射回数 / 描画距離 / 水の色 / 強調表示
+  // (どれかを変更したら蓄積をリセットする)
   let sunHour = 10.0;
+  let roughness = 0.10;
+  let raysPerPixel = 2;
   let reflectionCount = 2;
   let renderDistance = 150;
   let debugHighlight = false;
@@ -508,6 +627,23 @@ async function main() {
   sunHourInput.addEventListener('input', () => {
     sunHour = parseFloat(sunHourInput.value);
     sunHourVal.textContent = formatHour(sunHour);
+    frameIndex = 0;
+  });
+
+  const roughnessInput = document.getElementById('roughness');
+  const roughnessVal = document.getElementById('roughnessVal');
+  roughnessInput.addEventListener('input', () => {
+    roughness = parseInt(roughnessInput.value, 10) / 100;
+    roughnessVal.textContent = roughness.toFixed(2);
+    frameIndex = 0;
+  });
+
+  const raysPerPixelInput = document.getElementById('raysPerPixel');
+  const raysPerPixelVal = document.getElementById('raysPerPixelVal');
+  raysPerPixelInput.addEventListener('input', () => {
+    raysPerPixel = parseInt(raysPerPixelInput.value, 10);
+    raysPerPixelVal.textContent = String(raysPerPixel);
+    frameIndex = 0;
   });
 
   const reflectionCountInput = document.getElementById('reflectionCount');
@@ -515,6 +651,7 @@ async function main() {
   reflectionCountInput.addEventListener('input', () => {
     reflectionCount = parseInt(reflectionCountInput.value, 10);
     reflectionCountVal.textContent = String(reflectionCount);
+    frameIndex = 0;
   });
 
   const renderDistanceInput = document.getElementById('renderDistance');
@@ -522,11 +659,13 @@ async function main() {
   renderDistanceInput.addEventListener('input', () => {
     renderDistance = parseFloat(renderDistanceInput.value);
     renderDistanceVal.textContent = String(renderDistance);
+    frameIndex = 0;
   });
 
   const debugHighlightInput = document.getElementById('debugHighlight');
   debugHighlightInput.addEventListener('input', () => {
     debugHighlight = debugHighlightInput.checked;
+    frameIndex = 0;
   });
 
   function hexToRgb(hex) {
@@ -538,6 +677,7 @@ async function main() {
   debugColor = hexToRgb(debugColorInput.value);
   debugColorInput.addEventListener('input', () => {
     debugColor = hexToRgb(debugColorInput.value);
+    frameIndex = 0;
   });
 
   // フレネル透過成分の色(水そのものの色。反射失敗時のフォールバック色とは別の専用パラメータ)
@@ -545,10 +685,13 @@ async function main() {
   let waterColor = hexToRgb(waterColorInput.value);
   waterColorInput.addEventListener('input', () => {
     waterColor = hexToRgb(waterColorInput.value);
+    frameIndex = 0;
   });
 
-  // 波のアニメーションの一時停止/再生(再生を押すと止めた時点から自然に再開する)
-  let isPaused = false;
+  // 波のアニメーションの一時停止/再生。水面をmatteにするとノイズが乗るため、
+  // デフォルトで一時停止しておき、フレームを重ねて時間積分でノイズを収束させる。
+  // 再生中(波が動いている間)は毎フレーム蓄積をリセットして常に最新の1サンプルを表示する。
+  let isPaused = true;
   let pausedElapsed = 0;
   let startTime = performance.now();
   function currentITime() {
@@ -566,10 +709,11 @@ async function main() {
       pausedElapsed = (performance.now() - startTime) / 1000;
       isPaused = true;
       pauseButton.textContent = '再生';
+      frameIndex = 0; // 止めた時点の波で新しく蓄積し直す
     }
   });
 
-  const uniformData = new Float32Array(16);
+  const uniformData = new Float32Array(20);
 
   function frame() {
     const iTime = currentITime();
@@ -580,7 +724,7 @@ async function main() {
     uniformData[4] = reflectionCount;
     uniformData[5] = debugHighlight ? 1 : 0;
     uniformData[6] = renderDistance;
-    uniformData[7] = 0;
+    uniformData[7] = frameIndex;
     uniformData[8] = debugColor[0];
     uniformData[9] = debugColor[1];
     uniformData[10] = debugColor[2];
@@ -589,10 +733,33 @@ async function main() {
     uniformData[13] = waterColor[1];
     uniformData[14] = waterColor[2];
     uniformData[15] = 0;
+    uniformData[16] = raysPerPixel;
+    uniformData[17] = roughness;
+    uniformData[18] = 0;
+    uniformData[19] = 0;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
+    const srcIsA = frameIndex % 2 === 0;
+    const traceBindGroup = srcIsA ? traceBindGroupSrcA : traceBindGroupSrcB;
+    const dstView = srcIsA ? viewB : viewA;
+    const displayBindGroup = srcIsA ? displayBindGroupB : displayBindGroupA;
+
     const encoder = device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
+
+    const tracePass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: dstView,
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    tracePass.setPipeline(tracePipeline);
+    tracePass.setBindGroup(0, traceBindGroup);
+    tracePass.draw(3);
+    tracePass.end();
+
+    const displayPass = encoder.beginRenderPass({
       colorAttachments: [{
         view: context.getCurrentTexture().createView(),
         clearValue: { r: 0, g: 0, b: 0, a: 1 },
@@ -600,14 +767,21 @@ async function main() {
         storeOp: 'store',
       }],
     });
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.draw(3);
-    pass.end();
+    displayPass.setPipeline(displayPipeline);
+    displayPass.setBindGroup(0, displayBindGroup);
+    displayPass.draw(3);
+    displayPass.end();
+
     device.queue.submit([encoder.finish()]);
+
+    if (isPaused) {
+      frameIndex += 1;
+    }
+    sampleCountEl.textContent = String((isPaused ? frameIndex : 1) * raysPerPixel);
 
     requestAnimationFrame(frame);
   }
+  const sampleCountEl = document.getElementById('sampleCount');
   requestAnimationFrame(frame);
 }
 
