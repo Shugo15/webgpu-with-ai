@@ -102,6 +102,10 @@
     <span class="val" id="reflectionCountVal">2</span>
   </div>
   <div class="row">
+    <label for="waterColor">水の色(透過)</label>
+    <input id="waterColor" type="color" value="#0d3a45">
+  </div>
+  <div class="row">
     <label for="debugHighlight">失敗箇所を強調表示</label>
     <input id="debugHighlight" type="checkbox">
   </div>
@@ -123,6 +127,7 @@ struct Uniforms {
   resAndTime: vec4<f32>, // xy = resolution, z = iTime(波のアニメーションのみ), w = sunHour(太陽の時刻)
   params: vec4<f32>,     // x = maxBounces, y = debugMode(0/1), z/w未使用
   debugColor: vec4<f32>, // rgb = 強調表示の色, aは未使用
+  waterColor: vec4<f32>, // rgb = フレネル透過成分の色(水そのものの色), aは未使用
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
@@ -292,7 +297,16 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     // 水平な基準面(y=0)との交点(x,z)を求め、そこから反射回数の上限まで反射を試みる
     let t = -eye.y / rayDir.y;
     let hitXZ = eye.xz + rayDir.xz * t;
-    color = traceOceanReflection(rayDir, hitXZ, sunDir, iTime, maxBounces);
+    let firstNormal = gerstnerNormal(hitXZ, iTime);
+    let reflectionColor = traceOceanReflection(rayDir, hitXZ, sunDir, iTime, maxBounces);
+
+    // Fresnel(Schlick近似): 真上から見ると水色(透過)が主体、視線が水平に近づくほど反射が支配的になる
+    let viewDir = -rayDir;
+    let cosTheta = max(dot(viewDir, firstNormal), 0.0);
+    let f0 = 0.02; // 空気->水の垂直入射反射率(屈折率1.33相当)
+    let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+
+    color = mix(uniforms.waterColor.rgb, reflectionColor, fresnel);
   }
 
   let mapped = color / (color + vec3<f32>(1.0));
@@ -351,7 +365,7 @@ async function main() {
   });
 
   const uniformBuffer = device.createBuffer({
-    size: 48,
+    size: 64,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -390,17 +404,25 @@ async function main() {
     debugHighlight = debugHighlightInput.checked;
   });
 
-  const debugColorInput = document.getElementById('debugColor');
   function hexToRgb(hex) {
     const v = parseInt(hex.slice(1), 16);
     return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255];
   }
+
+  const debugColorInput = document.getElementById('debugColor');
   debugColor = hexToRgb(debugColorInput.value);
   debugColorInput.addEventListener('input', () => {
     debugColor = hexToRgb(debugColorInput.value);
   });
 
-  const uniformData = new Float32Array(12);
+  // フレネル透過成分の色(水そのものの色。反射失敗時のフォールバック色とは別の専用パラメータ)
+  const waterColorInput = document.getElementById('waterColor');
+  let waterColor = hexToRgb(waterColorInput.value);
+  waterColorInput.addEventListener('input', () => {
+    waterColor = hexToRgb(waterColorInput.value);
+  });
+
+  const uniformData = new Float32Array(16);
   const startTime = performance.now();
 
   function frame() {
@@ -417,6 +439,10 @@ async function main() {
     uniformData[9] = debugColor[1];
     uniformData[10] = debugColor[2];
     uniformData[11] = 0;
+    uniformData[12] = waterColor[0];
+    uniformData[13] = waterColor[1];
+    uniformData[14] = waterColor[2];
+    uniformData[15] = 0;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
     const encoder = device.createCommandEncoder();
