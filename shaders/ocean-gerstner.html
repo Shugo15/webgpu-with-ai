@@ -118,6 +118,11 @@
     <span class="val" id="reflectionCountVal">2</span>
   </div>
   <div class="row">
+    <label for="renderDistance">描画距離</label>
+    <input id="renderDistance" type="range" min="20" max="500" step="10" value="150">
+    <span class="val" id="renderDistanceVal">150</span>
+  </div>
+  <div class="row">
     <label for="waterColor">水の色(透過)</label>
     <input id="waterColor" type="color" value="#0d3a45">
   </div>
@@ -141,7 +146,7 @@
 const shaderCode = /* wgsl */ `
 struct Uniforms {
   resAndTime: vec4<f32>, // xy = resolution, z = iTime(波のアニメーションのみ), w = sunHour(太陽の時刻)
-  params: vec4<f32>,     // x = maxBounces, y = debugMode(0/1), z/w未使用
+  params: vec4<f32>,     // x = maxBounces, y = debugMode(0/1), z = 描画距離(maxDist), w未使用
   debugColor: vec4<f32>, // rgb = 強調表示の色, aは未使用
   waterColor: vec4<f32>, // rgb = フレネル透過成分の色(水そのものの色), aは未使用
 };
@@ -262,20 +267,32 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> vec4<f32> {
 }
 
 // レイと実際の波面(高さフィールド)の交差点を、区間探索+二分探索で求める。
+// 近距離は細かく・遠距離は粗くステップすることで、波の見た目の精度を
+// 落とさずに描画距離(maxDist)を伸ばせるようにしている。
 // 戻り値はxyz=交差点の座標, w=見つかったら1.0/見つからなければ0.0。
-fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32) -> vec4<f32> {
+fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32, maxDist: f32) -> vec4<f32> {
   if (rd.y >= -0.0001) {
     return vec4<f32>(0.0, 0.0, 0.0, 0.0);
   }
 
-  let maxDist = 40.0;
-  let steps = 24u;
-  let dt = maxDist / f32(steps);
+  let nearSteps = 16u;
+  let nearDist = 6.0;
+  let nearStep = nearDist / f32(nearSteps);
+
+  let farSteps = 24u;
+  let farDist = max(maxDist - nearDist, 1.0);
+  let farStep = farDist / f32(farSteps);
+
+  let steps = nearSteps + farSteps;
 
   var t0 = 0.0;
   var f0 = ro.y - gerstnerSample(ro.xz, time).w;
 
   for (var i = 0u; i < steps; i = i + 1u) {
+    var dt = nearStep;
+    if (i >= nearSteps) {
+      dt = farStep;
+    }
     let t1 = t0 + dt;
     let p1 = ro + rd * t1;
     let f1 = p1.y - gerstnerSample(p1.xz, time).w;
@@ -316,13 +333,13 @@ struct OceanTraceResult {
 // 実際の波面との交差点をレイマーチングで求めながら反射を繰り返す(1回目の反射も含めて
 // 反射回数としてカウントする)。上限まで繰り返しても交差点が見つからない(=十分遠くまで
 // 波が無い、ほぼ水平に近い方向へ反射していった)場合は空とみなす。
-fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f32>, iTime: f32, maxBounces: u32) -> OceanTraceResult {
+fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f32>, iTime: f32, maxBounces: u32, maxDist: f32) -> OceanTraceResult {
   var dir = rayDir;
   var ro = rayOrigin;
   var firstNormal = vec3<f32>(0.0, 1.0, 0.0);
 
   for (var i = 0u; i < maxBounces; i = i + 1u) {
-    let hit = intersectWater(ro, dir, iTime);
+    let hit = intersectWater(ro, dir, iTime, maxDist);
     if (hit.w < 0.5) {
       if (i == 0u) {
         // カメラのレイがそもそも水面に交差しなかった(極端に浅い角度) -> 空とみなす
@@ -372,6 +389,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let sunDir = normalize(vec3<f32>(cos(sunAngle) * 0.35, sin(sunAngle), -0.9));
 
   let maxBounces = u32(uniforms.params.x);
+  let renderDistance = uniforms.params.z;
 
   var color: vec3<f32>;
   if (rayDir.y >= -0.0005) {
@@ -379,7 +397,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     color = skyColor(rayDir, sunDir);
   } else {
     // 実際の波面とレイマーチングで交差判定を行い、反射回数の上限まで反射を試みる
-    let result = traceOceanReflection(rayDir, eye, sunDir, iTime, maxBounces);
+    let result = traceOceanReflection(rayDir, eye, sunDir, iTime, maxBounces, renderDistance);
 
     if (result.hitWater < 0.5) {
       color = result.color; // 交差点が見つからなかった(=空とみなす)
@@ -462,6 +480,7 @@ async function main() {
   // UI: 太陽の時刻(バーで設定、デフォルト10:00) / 反射回数 / 失敗箇所の強調表示
   let sunHour = 10.0;
   let reflectionCount = 2;
+  let renderDistance = 150;
   let debugHighlight = false;
   let debugColor = [1, 0, 1];
 
@@ -482,6 +501,13 @@ async function main() {
   reflectionCountInput.addEventListener('input', () => {
     reflectionCount = parseInt(reflectionCountInput.value, 10);
     reflectionCountVal.textContent = String(reflectionCount);
+  });
+
+  const renderDistanceInput = document.getElementById('renderDistance');
+  const renderDistanceVal = document.getElementById('renderDistanceVal');
+  renderDistanceInput.addEventListener('input', () => {
+    renderDistance = parseFloat(renderDistanceInput.value);
+    renderDistanceVal.textContent = String(renderDistance);
   });
 
   const debugHighlightInput = document.getElementById('debugHighlight');
@@ -539,7 +565,7 @@ async function main() {
     uniformData[3] = sunHour;
     uniformData[4] = reflectionCount;
     uniformData[5] = debugHighlight ? 1 : 0;
-    uniformData[6] = 0;
+    uniformData[6] = renderDistance;
     uniformData[7] = 0;
     uniformData[8] = debugColor[0];
     uniformData[9] = debugColor[1];
