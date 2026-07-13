@@ -331,6 +331,21 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
   return WaveSample(normal, height, laplacian, largeHeight);
 }
 
+// 太陽のグリッター(sun glitter): 環境(空)を反射させてたまたま太陽の円盤に当たるのを
+// 待つのではなく、水面の各点で太陽方向への鏡面ハイライトを直接計算する項。
+// 無数の波面がそれぞれ少しずつ違う傾きを持ち、太陽方向から多少ずれた面でも
+// なだらかに(ゼロではなく)反射が返ってくることで、集中して外側に向かって滑らかに
+// 減衰するキラキラの帯として現れる。Blinn-Phongのハーフベクトル方式で、
+// 粗さ(roughness)が大きいほどローブを広く・弱くする(現実の風が強い海ほど
+// グリッターが広く薄くなるのに対応)。
+fn sunGlitter(normal: vec3<f32>, viewDir: vec3<f32>, sunDir: vec3<f32>, roughness: f32) -> f32 {
+  let halfDir = normalize(viewDir + sunDir);
+  let ndotH = max(dot(normal, halfDir), 0.0);
+  let shininess = mix(6000.0, 24.0, clamp(roughness / 0.5, 0.0, 1.0));
+  let normalization = (shininess + 2.0) / (2.0 * PI);
+  return normalization * pow(ndotH, shininess);
+}
+
 // 波の山(とんがっていて、かつ急な部分)を白波として検出する係数(0〜1)を返す。
 // ラプラシアンの負の部分(=凸な山)だけを拾い、法線の傾き(1-normal.y、急なほど大きい)を
 // 掛け合わせる。さらに、大きなうねり自体の頂上付近(largeHeightが高いところ)に近いほど
@@ -576,6 +591,10 @@ fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
         let foam = whitecapFactor(result.firstPosXZ, firstWave, whitecapThreshold, result.firstDist) * sunVisibility;
         let foamColor = vec3<f32>(1.0, 1.0, 1.02); // 泡(明るいが真っ白に飛ばしすぎない)
         waterColorResult = mix(waterColorResult, foamColor, foam);
+
+        // 太陽のグリッター: 環境(空)の反射に頼らず、直接鏡面ハイライトを加算する
+        let glitter = sunGlitter(result.firstNormal, viewDir, sunDir, roughness) * sunVisibility;
+        waterColorResult += vec3<f32>(1.0, 0.95, 0.85) * glitter * 3.0;
 
         sampleColor = waterColorResult;
       }
