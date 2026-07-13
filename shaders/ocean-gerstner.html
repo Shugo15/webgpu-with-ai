@@ -65,6 +65,16 @@
     width: 3.5em;
     text-align: right;
   }
+  #panel .row + .row {
+    margin-top: 0.5rem;
+  }
+  #panel input[type="color"] {
+    width: 2.2em;
+    height: 1.4em;
+    padding: 0;
+    border: none;
+    background: none;
+  }
   #error {
     display: none;
     position: fixed;
@@ -86,6 +96,19 @@
     <input id="sunHour" type="range" min="0" max="24" step="0.1" value="10">
     <span class="val" id="sunHourVal">10:00</span>
   </div>
+  <div class="row">
+    <label for="reflectionCount">反射回数</label>
+    <input id="reflectionCount" type="range" min="1" max="5" step="1" value="2">
+    <span class="val" id="reflectionCountVal">2</span>
+  </div>
+  <div class="row">
+    <label for="debugHighlight">失敗箇所を強調表示</label>
+    <input id="debugHighlight" type="checkbox">
+  </div>
+  <div class="row">
+    <label for="debugColor">強調表示の色</label>
+    <input id="debugColor" type="color" value="#ff00ff">
+  </div>
 </div>
 <canvas id="gpuCanvas"></canvas>
 <div id="error"></div>
@@ -98,6 +121,8 @@
 const shaderCode = /* wgsl */ `
 struct Uniforms {
   resAndTime: vec4<f32>, // xy = resolution, z = iTime(波のアニメーションのみ), w = sunHour(太陽の時刻)
+  params: vec4<f32>,     // x = maxBounces, y = debugMode(0/1), z/w未使用
+  debugColor: vec4<f32>, // rgb = 強調表示の色, aは未使用
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
@@ -210,6 +235,32 @@ fn gerstnerNormal(pos: vec2<f32>, time: f32) -> vec3<f32> {
   return normalize(vec3<f32>(-sumDx, 1.0 - sumY, -sumDz));
 }
 
+// 波の斜面で反射した先がまた下向き(=水面自身)になってしまう場合、
+// 平面近似では同じ交点に戻ってしまい交差計算ができないため、反射方向沿いに
+// 少しだけ水平移動した先でガーストナー法線を再サンプリングし、そこでもう一度
+// 反射する、を反射回数の上限まで繰り返す近似。現実には波の谷から別の波を
+// 反射で見ている状況に相当する。
+fn traceOceanReflection(rayDir: vec3<f32>, hitXZ: vec2<f32>, sunDir: vec3<f32>, iTime: f32, maxBounces: u32) -> vec3<f32> {
+  var dir = rayDir;
+  var posXZ = hitXZ;
+  let bounceStep = 0.6;
+
+  for (var i = 0u; i < maxBounces; i = i + 1u) {
+    let n = gerstnerNormal(posXZ, iTime);
+    dir = reflect(dir, n);
+    if (dir.y >= -0.0005) {
+      return skyColor(dir, sunDir);
+    }
+    posXZ = posXZ + normalize(dir.xz) * bounceStep;
+  }
+
+  // 反射回数を使い切っても下向きのまま = 波の谷が深すぎて水面近似が破綻したケース
+  if (uniforms.params.y > 0.5) {
+    return uniforms.debugColor.rgb;
+  }
+  return vec3<f32>(0.02, 0.05, 0.08); // 水面が水面自身を映す、それらしい暗い水色
+}
+
 @fragment
 fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let res = uniforms.resAndTime.xy;
@@ -231,17 +282,17 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let sunAngle = (sunHour - 6.0) / 12.0 * PI;
   let sunDir = normalize(vec3<f32>(cos(sunAngle) * 0.35, sin(sunAngle), -0.9));
 
+  let maxBounces = u32(uniforms.params.x);
+
   var color: vec3<f32>;
   if (rayDir.y >= -0.0005) {
     // 水平線より上 -> 空をそのまま見る
     color = skyColor(rayDir, sunDir);
   } else {
-    // 水平な基準面(y=0)との交点(x,z)でガーストナー法線を求め、そこで反射する
+    // 水平な基準面(y=0)との交点(x,z)を求め、そこから反射回数の上限まで反射を試みる
     let t = -eye.y / rayDir.y;
     let hitXZ = eye.xz + rayDir.xz * t;
-    let n = gerstnerNormal(hitXZ, iTime);
-    let reflected = reflect(rayDir, n);
-    color = skyColor(reflected, sunDir);
+    color = traceOceanReflection(rayDir, hitXZ, sunDir, iTime, maxBounces);
   }
 
   let mapped = color / (color + vec3<f32>(1.0));
@@ -300,7 +351,7 @@ async function main() {
   });
 
   const uniformBuffer = device.createBuffer({
-    size: 16,
+    size: 48,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -309,8 +360,12 @@ async function main() {
     entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
   });
 
-  // UI: 太陽の時刻(バーで設定、デフォルト10:00)
+  // UI: 太陽の時刻(バーで設定、デフォルト10:00) / 反射回数 / 失敗箇所の強調表示
   let sunHour = 10.0;
+  let reflectionCount = 2;
+  let debugHighlight = false;
+  let debugColor = [1, 0, 1];
+
   const sunHourInput = document.getElementById('sunHour');
   const sunHourVal = document.getElementById('sunHourVal');
   function formatHour(h) {
@@ -323,7 +378,29 @@ async function main() {
     sunHourVal.textContent = formatHour(sunHour);
   });
 
-  const uniformData = new Float32Array(4);
+  const reflectionCountInput = document.getElementById('reflectionCount');
+  const reflectionCountVal = document.getElementById('reflectionCountVal');
+  reflectionCountInput.addEventListener('input', () => {
+    reflectionCount = parseInt(reflectionCountInput.value, 10);
+    reflectionCountVal.textContent = String(reflectionCount);
+  });
+
+  const debugHighlightInput = document.getElementById('debugHighlight');
+  debugHighlightInput.addEventListener('input', () => {
+    debugHighlight = debugHighlightInput.checked;
+  });
+
+  const debugColorInput = document.getElementById('debugColor');
+  function hexToRgb(hex) {
+    const v = parseInt(hex.slice(1), 16);
+    return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255];
+  }
+  debugColor = hexToRgb(debugColorInput.value);
+  debugColorInput.addEventListener('input', () => {
+    debugColor = hexToRgb(debugColorInput.value);
+  });
+
+  const uniformData = new Float32Array(12);
   const startTime = performance.now();
 
   function frame() {
@@ -332,6 +409,14 @@ async function main() {
     uniformData[1] = canvas.height;
     uniformData[2] = iTime;
     uniformData[3] = sunHour;
+    uniformData[4] = reflectionCount;
+    uniformData[5] = debugHighlight ? 1 : 0;
+    uniformData[6] = 0;
+    uniformData[7] = 0;
+    uniformData[8] = debugColor[0];
+    uniformData[9] = debugColor[1];
+    uniformData[10] = debugColor[2];
+    uniformData[11] = 0;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
     const encoder = device.createCommandEncoder();
