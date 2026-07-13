@@ -11,11 +11,14 @@
     height: 100%;
     background: #000;
     overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
   canvas {
     display: block;
-    width: 100vw;
-    height: 100vh;
+    width: min(100vw, 100vh);
+    height: min(100vw, 100vh);
   }
   #back {
     position: fixed;
@@ -115,8 +118,9 @@ async function main() {
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, Math.floor(window.innerWidth * dpr));
-    canvas.height = Math.max(1, Math.floor(window.innerHeight * dpr));
+    const size = Math.max(1, Math.floor(Math.min(window.innerWidth, window.innerHeight) * dpr));
+    canvas.width = size;
+    canvas.height = size;
     context.configure({
       device,
       format,
