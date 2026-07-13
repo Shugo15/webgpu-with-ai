@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Cornell Box レイマーチング - WebGPU Shader Playground</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+  }
+  #back {
+    position: fixed;
+    top: 1rem;
+    left: 1rem;
+    z-index: 10;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.5);
+    font-family: system-ui, sans-serif;
+    font-size: 0.9rem;
+    text-decoration: none;
+    padding: 0.4rem 0.8rem;
+    border-radius: 6px;
+  }
+  #back:hover {
+    background: rgba(0, 0, 0, 0.75);
+  }
+  #panel {
+    position: fixed;
+    top: 1rem;
+    right: 1rem;
+    z-index: 10;
+    color: #eee;
+    background: rgba(0, 0, 0, 0.55);
+    font-family: system-ui, sans-serif;
+    font-size: 0.8rem;
+    padding: 0.8rem 1rem;
+    border-radius: 8px;
+    min-width: 220px;
+  }
+  #panel .row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+  #panel .row:last-child {
+    margin-bottom: 0;
+  }
+  #panel label {
+    flex: 1;
+  }
+  #panel input[type="range"] {
+    flex: 1;
+  }
+  #panel .val {
+    width: 2em;
+    text-align: right;
+  }
+  #panel .samples {
+    color: #9c9;
+  }
+  #error {
+    display: none;
+    position: fixed;
+    inset: 0;
+    color: #fff;
+    background: #111;
+    font-family: system-ui, sans-serif;
+    padding: 2rem;
+    box-sizing: border-box;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<a id="back" href="../index.html">&larr; 一覧に戻る</a>
+<div id="panel">
+  <div class="row">
+    <label for="maxBounces">反射回数上限</label>
+    <input id="maxBounces" type="range" min="1" max="10" step="1" value="4">
+    <span class="val" id="maxBouncesVal">4</span>
+  </div>
+  <div class="row">
+    <label for="raysPerPixel">レイ数/pixel</label>
+    <input id="raysPerPixel" type="range" min="1" max="8" step="1" value="1">
+    <span class="val" id="raysPerPixelVal">1</span>
+  </div>
+  <div class="row">
+    <span>累積サンプル数</span>
+    <span class="samples" id="sampleCount">0</span>
+  </div>
+</div>
+<canvas id="gpuCanvas"></canvas>
+<div id="error"></div>
+
+<script>
+// フルスクリーン三角形の頂点シェーダー(全モジュール共通)
+const vertexShaderCode = /* wgsl */ `
+@vertex
+fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0)
+  );
+  return vec4<f32>(pos[vertexIndex], 0.0, 1.0);
+}
+`;
+
+// Cornell Box を SDF レイマーチング + 簡易パストレーシングで描画し、
+// 前フレームの平均値と混ぜて時間方向に積分(累積平均)していくパス。
+const traceShaderCode = /* wgsl */ `
+${vertexShaderCode}
+
+struct Uniforms {
+  resAndTime: vec4<f32>, // xy = resolution, z = iTime, w = frameIndex
+  params: vec4<f32>,     // x = maxBounces, y = raysPerPixel
+};
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(1) var prevTex: texture_2d<f32>;
+
+fn sdBox(p: vec3<f32>, b: vec3<f32>) -> f32 {
+  let q = abs(p) - b;
+  return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+fn rotateY(p: vec3<f32>, angle: f32) -> vec3<f32> {
+  let s = sin(angle);
+  let c = cos(angle);
+  return vec3<f32>(c * p.x + s * p.z, p.y, -s * p.x + c * p.z);
+}
+
+fn opU(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+  return select(b, a, a.x < b.x);
+}
+
+// 戻り値: (distance, materialId)
+// id: 0=白い壁/床/天井, 1=左(赤), 2=右(緑), 3,4=箱(白), 5=光源
+fn map(p: vec3<f32>) -> vec2<f32> {
+  var res = vec2<f32>(p.y, 0.0);                 // 床 (y=0)
+  res = opU(res, vec2<f32>(2.0 - p.y, 0.0));     // 天井 (y=2)
+  res = opU(res, vec2<f32>(p.z + 1.0, 0.0));     // 奥壁 (z=-1)
+  res = opU(res, vec2<f32>(p.x + 1.0, 1.0));     // 左壁 (x=-1) 赤
+  res = opU(res, vec2<f32>(1.0 - p.x, 2.0));     // 右壁 (x=1) 緑
+
+  let lightCenter = vec3<f32>(0.0, 1.999, 0.0);
+  let lightHalf = vec3<f32>(0.35, 0.01, 0.35);
+  res = opU(res, vec2<f32>(sdBox(p - lightCenter, lightHalf), 5.0));
+
+  let box1Center = vec3<f32>(-0.35, 0.6, -0.3);
+  let box1Half = vec3<f32>(0.3, 0.6, 0.3);
+  res = opU(res, vec2<f32>(sdBox(rotateY(p - box1Center, -0.35), box1Half), 3.0));
+
+  let box2Center = vec3<f32>(0.35, 0.3, 0.35);
+  let box2Half = vec3<f32>(0.3, 0.3, 0.3);
+  res = opU(res, vec2<f32>(sdBox(rotateY(p - box2Center, 0.3), box2Half), 4.0));
+
+  return res;
+}
+
+fn calcNormal(p: vec3<f32>) -> vec3<f32> {
+  let e = vec2<f32>(0.0015, 0.0);
+  return normalize(vec3<f32>(
+    map(p + e.xyy).x - map(p - e.xyy).x,
+    map(p + e.yxy).x - map(p - e.yxy).x,
+    map(p + e.yyx).x - map(p - e.yyx).x
+  ));
+}
+
+// 戻り値: (t, materialId, hitFlag)
+fn raymarch(ro: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
+  var t = 0.0;
+  for (var i = 0; i < 128; i = i + 1) {
+    let p = ro + rd * t;
+    let res = map(p);
+    if (res.x < 0.0008) {
+      return vec3<f32>(t, res.y, 1.0);
+    }
+    t = t + res.x;
+    if (t > 30.0) {
+      break;
+    }
+  }
+  return vec3<f32>(t, -1.0, 0.0);
+}
+
+fn materialAlbedo(id: f32) -> vec3<f32> {
+  if (id < 0.5) { return vec3<f32>(0.78, 0.78, 0.78); }
+  if (id < 1.5) { return vec3<f32>(0.75, 0.15, 0.15); }
+  if (id < 2.5) { return vec3<f32>(0.15, 0.55, 0.15); }
+  return vec3<f32>(0.75, 0.75, 0.75);
+}
+
+fn pcgHash(input: u32) -> u32 {
+  var state = input * 747796405u + 2891336453u;
+  var word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+fn rand(seed: ptr<function, u32>) -> f32 {
+  *seed = pcgHash(*seed);
+  return f32(*seed) / 4294967295.0;
+}
+
+fn cosineSampleHemisphere(n: vec3<f32>, seed: ptr<function, u32>) -> vec3<f32> {
+  let r1 = rand(seed);
+  let r2 = rand(seed);
+  let phi = 6.2831853 * r1;
+  let cosTheta = sqrt(1.0 - r2);
+  let sinTheta = sqrt(r2);
+  let localX = cos(phi) * sinTheta;
+  let localY = sin(phi) * sinTheta;
+
+  var upVec = vec3<f32>(0.0, 1.0, 0.0);
+  if (abs(n.y) > 0.99) {
+    upVec = vec3<f32>(1.0, 0.0, 0.0);
+  }
+  let tangent = normalize(cross(upVec, n));
+  let bitangent = cross(n, tangent);
+  return normalize(tangent * localX + bitangent * localY + n * cosTheta);
+}
+
+fn tracePath(roIn: vec3<f32>, rdIn: vec3<f32>, maxBounces: u32, seed: ptr<function, u32>) -> vec3<f32> {
+  var ro = roIn;
+  var rd = rdIn;
+  var throughput = vec3<f32>(1.0, 1.0, 1.0);
+  var radiance = vec3<f32>(0.0, 0.0, 0.0);
+
+  for (var bounce: u32 = 0u; bounce < maxBounces; bounce = bounce + 1u) {
+    let hit = raymarch(ro, rd);
+    if (hit.z < 0.5) {
+      break; // 何にも当たらず背景(黒)へ抜けた
+    }
+    let id = hit.y;
+    if (id > 4.5) {
+      radiance += throughput * vec3<f32>(14.0, 14.0, 14.0); // 光源に到達
+      break;
+    }
+    let p = ro + rd * hit.x;
+    let n = calcNormal(p);
+    let albedo = materialAlbedo(id);
+    throughput = throughput * albedo;
+    let newDir = cosineSampleHemisphere(n, seed);
+    ro = p + n * 0.002;
+    rd = newDir;
+  }
+  return radiance;
+}
+
+@fragment
+fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let res = uniforms.resAndTime.xy;
+  let frameIndex = uniforms.resAndTime.w;
+  let maxBounces = u32(uniforms.params.x);
+  let raysPerPixel = u32(uniforms.params.y);
+
+  // 固定カメラ(時間で動かさない)
+  let eye = vec3<f32>(0.0, 1.0, 3.2);
+  let lookAt = vec3<f32>(0.0, 1.0, 0.0);
+  let forward = normalize(lookAt - eye);
+  let worldUp = vec3<f32>(0.0, 1.0, 0.0);
+  let right = normalize(cross(forward, worldUp));
+  let up = cross(right, forward);
+  let fov = 0.9;
+
+  let pixelIndex = u32(fragCoord.y) * u32(res.x) + u32(fragCoord.x);
+  var colorSum = vec3<f32>(0.0, 0.0, 0.0);
+
+  for (var s: u32 = 0u; s < raysPerPixel; s = s + 1u) {
+    var seed = pixelIndex * 9781u + u32(frameIndex) * 6271u + s * 26699u + 1u;
+    let jitter = vec2<f32>(rand(&seed), rand(&seed)) - 0.5;
+    let ndc = ((fragCoord.xy + jitter) - 0.5 * res) / res.y;
+    let dir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
+    colorSum += tracePath(eye, dir, maxBounces, &seed);
+  }
+  let currentSample = colorSum / f32(raysPerPixel);
+
+  let prev = textureLoad(prevTex, vec2<i32>(i32(fragCoord.x), i32(fragCoord.y)), 0).rgb;
+  let n = frameIndex + 1.0;
+  let newAvg = prev + (currentSample - prev) / n;
+  return vec4<f32>(newAvg, 1.0);
+}
+`;
+
+// 累積平均バッファをトーンマッピングしてcanvasへ表示するだけのパス
+const displayShaderCode = /* wgsl */ `
+${vertexShaderCode}
+
+@group(0) @binding(0) var avgTex: texture_2d<f32>;
+
+@fragment
+fn fs_display(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let c = textureLoad(avgTex, vec2<i32>(i32(fragCoord.x), i32(fragCoord.y)), 0).rgb;
+  let mapped = c / (c + vec3<f32>(1.0));
+  let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
+  return vec4<f32>(gamma, 1.0);
+}
+`;
+
+async function main() {
+  const canvas = document.getElementById('gpuCanvas');
+
+  if (!navigator.gpu) {
+    showError('このブラウザはWebGPUに対応していません。\nChrome/Edge の最新版などでお試しください。');
+    return;
+  }
+
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    showError('WebGPUアダプタの取得に失敗しました。');
+    return;
+  }
+  const device = await adapter.requestDevice();
+  device.lost.then((info) => console.log('WebGPU device lost:', info.reason, info.message));
+
+  const context = canvas.getContext('webgpu');
+  const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+  const accumFormat = 'rgba16float';
+
+  const traceModule = device.createShaderModule({ code: traceShaderCode });
+  const displayModule = device.createShaderModule({ code: displayShaderCode });
+
+  const tracePipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: traceModule, entryPoint: 'vs_main' },
+    fragment: { module: traceModule, entryPoint: 'fs_trace', targets: [{ format: accumFormat }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  const displayPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: displayModule, entryPoint: 'vs_main' },
+    fragment: { module: displayModule, entryPoint: 'fs_display', targets: [{ format: canvasFormat }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  // params: x=iTime, y=frameIndex は毎フレーム書き換え。resolution/maxBounces/raysPerPixelも同バッファ内。
+  const uniformBuffer = device.createBuffer({
+    size: 32,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  let texA = null, texB = null;
+  let viewA = null, viewB = null;
+  let traceBindGroupSrcA = null; // prevTex = A (Bへ書く)
+  let traceBindGroupSrcB = null; // prevTex = B (Aへ書く)
+  let displayBindGroupA = null;  // avgTex = A
+  let displayBindGroupB = null;  // avgTex = B
+  let frameIndex = 0;
+
+  function createAccumTextures(width, height) {
+    if (texA) texA.destroy();
+    if (texB) texB.destroy();
+    texA = device.createTexture({
+      size: [width, height],
+      format: accumFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    texB = device.createTexture({
+      size: [width, height],
+      format: accumFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    viewA = texA.createView();
+    viewB = texB.createView();
+
+    traceBindGroupSrcA = device.createBindGroup({
+      layout: tracePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 1, resource: viewA },
+      ],
+    });
+    traceBindGroupSrcB = device.createBindGroup({
+      layout: tracePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 1, resource: viewB },
+      ],
+    });
+    displayBindGroupA = device.createBindGroup({
+      layout: displayPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: viewA }],
+    });
+    displayBindGroupB = device.createBindGroup({
+      layout: displayPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: viewB }],
+    });
+  }
+
+  function resize() {
+    const w = Math.max(1, Math.floor(window.innerWidth));
+    const h = Math.max(1, Math.floor(window.innerHeight));
+    canvas.width = w;
+    canvas.height = h;
+    context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+    createAccumTextures(w, h);
+    frameIndex = 0;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // UI: 反射回数上限 / 1ピクセルあたりのレイ数(変更したら蓄積をリセット)
+  let maxBounces = 4;
+  let raysPerPixel = 1;
+  const maxBouncesInput = document.getElementById('maxBounces');
+  const raysPerPixelInput = document.getElementById('raysPerPixel');
+  const maxBouncesVal = document.getElementById('maxBouncesVal');
+  const raysPerPixelVal = document.getElementById('raysPerPixelVal');
+  const sampleCountEl = document.getElementById('sampleCount');
+
+  maxBouncesInput.addEventListener('input', () => {
+    maxBounces = parseInt(maxBouncesInput.value, 10);
+    maxBouncesVal.textContent = String(maxBounces);
+    frameIndex = 0;
+  });
+  raysPerPixelInput.addEventListener('input', () => {
+    raysPerPixel = parseInt(raysPerPixelInput.value, 10);
+    raysPerPixelVal.textContent = String(raysPerPixel);
+    frameIndex = 0;
+  });
+
+  const uniformData = new Float32Array(8);
+  const startTime = performance.now();
+
+  function frame() {
+    const iTime = (performance.now() - startTime) / 1000;
+    uniformData[0] = canvas.width;
+    uniformData[1] = canvas.height;
+    uniformData[2] = iTime;
+    uniformData[3] = frameIndex;
+    uniformData[4] = maxBounces;
+    uniformData[5] = raysPerPixel;
+    uniformData[6] = 0;
+    uniformData[7] = 0;
+    device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+
+    const srcIsA = frameIndex % 2 === 0;
+    const traceBindGroup = srcIsA ? traceBindGroupSrcA : traceBindGroupSrcB;
+    const dstView = srcIsA ? viewB : viewA;
+    const displayBindGroup = srcIsA ? displayBindGroupB : displayBindGroupA;
+
+    const encoder = device.createCommandEncoder();
+
+    const tracePass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: dstView,
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    tracePass.setPipeline(tracePipeline);
+    tracePass.setBindGroup(0, traceBindGroup);
+    tracePass.draw(3);
+    tracePass.end();
+
+    const displayPass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    displayPass.setPipeline(displayPipeline);
+    displayPass.setBindGroup(0, displayBindGroup);
+    displayPass.draw(3);
+    displayPass.end();
+
+    device.queue.submit([encoder.finish()]);
+
+    frameIndex += 1;
+    sampleCountEl.textContent = String(frameIndex * raysPerPixel);
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+function showError(message) {
+  const el = document.getElementById('error');
+  el.textContent = message;
+  el.style.display = 'block';
+}
+
+main().catch((err) => {
+  console.error(err);
+  showError('エラーが発生しました:\n' + err.message);
+});
+</script>
+</body>
+</html>
