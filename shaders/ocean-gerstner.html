@@ -124,7 +124,7 @@
   </div>
   <div class="row">
     <label for="waterColor">水の色(透過)</label>
-    <input id="waterColor" type="color" value="#0d3a45">
+    <input id="waterColor" type="color" value="#04174d">
   </div>
   <div class="row">
     <label for="debugHighlight">失敗箇所を強調表示</label>
@@ -180,6 +180,12 @@ fn hash21(p: vec2<f32>) -> f32 {
   return fract((p3.x + p3.y) * p3.z);
 }
 
+// 太陽がどれだけ地平線の上にあるか(0=夜, 1=昼)。空の明るさにも、水中に
+// 届く太陽光の量(透過色の明るさ)にも共通して使う。
+fn sunVisibilityOf(sunDir: vec3<f32>) -> f32 {
+  return smoothstep(-0.12, 0.06, sunDir.y);
+}
+
 // 空気の層をどれだけ通過するか(光路長)を、水平線に近いほど長くなる
 // 単純な指数関数(1/仰角)で近似する(shaders/analytic-sky.htmlと同じモデル)。
 fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
@@ -190,7 +196,7 @@ fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
   let mieG = 0.82;
   let opticalScale = 0.15;
 
-  let sunVisibility = smoothstep(-0.12, 0.06, sunDir.y);
+  let sunVisibility = sunVisibilityOf(sunDir);
 
   if (dir.y < 0.0) {
     let hazeColor = vec3<f32>(0.55, 0.5, 0.45) * sunVisibility;
@@ -408,7 +414,15 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
       let f0 = 0.02; // 空気->水の垂直入射反射率(屈折率1.33相当)
       let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
 
-      color = mix(uniforms.waterColor.rgb, result.color, fresnel);
+      // 透過色(水そのものの色)は、深いところまで潜って戻ってきた光の色として
+      // 深さに依存しない一定の色に収束する(uniforms.waterColor、Pope & Fry (1997)の
+      // 純水吸収スペクトルに基づく比率をデフォルト値にしている)。ただし太陽が沈んでいれば
+      // そもそも水中に届く光が無いので、太陽の可視度(sunVisibilityOf)で明るさを掛けて
+      // 夜は暗く落ちるようにする。
+      let sunVisibility = sunVisibilityOf(sunDir);
+      let transmissionColor = uniforms.waterColor.rgb * sunVisibility;
+
+      color = mix(transmissionColor, result.color, fresnel);
     }
   }
 
