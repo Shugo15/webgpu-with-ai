@@ -98,9 +98,10 @@ fn hash21(p: vec2<f32>) -> f32 {
 fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
   let cosTheta = dot(dir, sunDir);
 
-  let rayleighCoeff = vec3<f32>(0.3, 0.55, 1.3);
-  let mieCoeff = 0.15;
-  let mieG = 0.88;
+  let rayleighCoeff = vec3<f32>(0.1, 0.5, 2.0);
+  let mieCoeff = 0.12;
+  let mieG = 0.82;
+  let opticalScale = 0.15;
 
   let sunVisibility = smoothstep(-0.12, 0.06, sunDir.y);
 
@@ -113,18 +114,18 @@ fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
 
   // 視線方向の光路(長いほど大気を長く通って減衰する = 水平線に近いほど長い)
   let viewElevation = max(dir.y, 0.02);
-  let viewExtinction = exp(-(1.0 / viewElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * 0.15);
+  let viewExtinction = exp(-(1.0 / viewElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * opticalScale);
 
   // 太陽光自体が地表に届くまでに通ってきた光路(これが短波長=青を減衰させ、
   // 夕焼けが赤くなる主因。視線方向の減衰だけでは色が付かないので別途必要)
   let sunElevation = max(sunDir.y, 0.02);
-  let sunTransmittance = exp(-(1.0 / sunElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * 0.15);
+  let sunTransmittance = exp(-(1.0 / sunElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * opticalScale);
 
   let rayleighInscatter = rayleighCoeff * rayleighPhase(cosTheta);
   let mieInscatter = vec3<f32>(mieCoeff) * miePhase(cosTheta, mieG);
   let inscatter = (rayleighInscatter + mieInscatter) * viewExtinction * sunTransmittance;
 
-  var col = inscatter * sunVisibility * 7.0;
+  var col = inscatter * sunVisibility * 10.0;
 
   // 太陽本体(円盤)。色そのものもsunTransmittanceで夕焼け時に赤くなる
   let sunDisc = smoothstep(0.9995, 0.9999, cosTheta) * sunVisibility;
