@@ -127,6 +127,16 @@
     <label for="waterColor">水の色(透過)</label>
     <input id="waterColor" type="color" value="#04174d">
   </div>
+  <div class="row">
+    <label for="highlightSharpness">ハイライトの鋭さ</label>
+    <input id="highlightSharpness" type="range" min="1" max="100" step="1" value="60">
+    <span class="val" id="highlightSharpnessVal">60</span>
+  </div>
+  <div class="row">
+    <label for="highlightIntensity">ハイライトの強さ</label>
+    <input id="highlightIntensity" type="range" min="0" max="500" step="10" value="150">
+    <span class="val" id="highlightIntensityVal">150%</span>
+  </div>
 </div>
 <input id="importSkyFile" type="file" accept="image/png" style="display:none">
 <canvas id="gpuCanvas"></canvas>
@@ -149,17 +159,17 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f
 // 海面を波のない完全な平面(y=0)として扱い、shaders/sky-precise.htmlで焼き込んだ
 // equirectangular PNGを空として反射させるだけの、最も単純な海。
 // ガーストナー波(shaders/ocean-gerstner.html)のような高さフィールドの探索・粗さによる
-// 散乱・白波・グリッターは持たない。無限に平らな鏡面なので反射方向は視線方向だけで決まり
+// 散乱・白波は持たないが、太陽方向への明示的なハイライト(sunGlitter())は追加している
+// (下記コメント参照)。無限に平らな鏡面なので反射方向は視線方向だけで決まり
 // (法線が(0,1,0)で一定なため、水面上のどの位置で反射しても結果は同じ)、交差点の座標自体は
 // 計算に使わない。そのため蓄積(時間積分)も不要で、フレームごとに再計算するだけの
-// リアルタイム描画になっている。太陽の輝きも乱数によるグリッターではなく、焼き込み画像に
-// 元々含まれる太陽円盤がそのまま鏡面反射で映り込む形で表現される。
+// リアルタイム描画になっている。
 const traceShaderCode = /* wgsl */ `
 ${vertexShaderCode}
 
 struct Uniforms {
-  resAndSun: vec4<f32>,  // xy = resolution, z = sunHour(太陽の時刻), w未使用
-  waterColor: vec4<f32>, // rgb = フレネル透過成分の色(水そのものの色), aは未使用
+  resAndSun: vec4<f32>,  // xy = resolution, z = sunHour(太陽の時刻), w = ハイライトのshininess
+  waterColor: vec4<f32>, // rgb = フレネル透過成分の色(水そのものの色), a = ハイライト強度
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var envTex: texture_2d<f32>;
@@ -201,12 +211,32 @@ fn sampleSky(dir: vec3<f32>) -> vec3<f32> {
   return textureSampleLevel(envTex, envSampler, uv, 0.0).rgb;
 }
 
+// 太陽方向への明示的なハイライト(shaders/ocean-gerstner.htmlのsunGlitter()と同じ
+// Blinn-Phong方式)。理屈上は完全な鏡面なので、焼き込み画像内の太陽円盤が反射方向に
+// そのまま映り込むだけでも太陽の輝きは表現されるはずだが、equirectテクスチャ上での
+// 太陽の角サイズはわずか数ピクセルしかなく、フレームバッファ解像度・4サンプルのAA・
+// bilinear補間だけでは、カメラの向きによってハイライトが消えたりチラついたりして
+// 安定して見えない。そこでテクスチャの中身に頼らず、sunDir(スライダーの時刻)から
+// 直接ハイライトの明るさを計算し、確実にサンプルできる形で加算する。
+// 水面自体は完全に平らな鏡面のままなので、このハイライトの幅(shininess)は
+// 物理的な「粗さ」ではなく、写真でも実際に観測される(カメラ/眼のレンズや水面の
+// 微小な波によるにじみに相当する)見た目の輝きの広がりを表す演出的なパラメータ。
+fn sunGlitter(viewDir: vec3<f32>, sunDir: vec3<f32>, shininess: f32) -> f32 {
+  let normal = vec3<f32>(0.0, 1.0, 0.0);
+  let halfDir = normalize(viewDir + sunDir);
+  let ndotH = max(dot(normal, halfDir), 0.0);
+  let normalization = (shininess + 2.0) / (2.0 * PI);
+  return normalization * pow(ndotH, shininess);
+}
+
 @fragment
 fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let res = uniforms.resAndSun.xy;
   let sunHour = uniforms.resAndSun.z;
   let sunDir = hourToSunDir(sunHour);
   let transmissionColor = uniforms.waterColor.rgb * sunVisibilityOf(sunDir);
+  let shininess = uniforms.resAndSun.w;
+  let glitterIntensity = uniforms.waterColor.a;
 
   // 固定カメラ(水平方向を向く。shaders/ocean-gerstner.htmlと同じ配置)
   let eye = vec3<f32>(0.0, 2.5, 0.0);
@@ -242,7 +272,11 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
       let f0 = 0.02; // 空気->水の垂直入射反射率(屈折率1.33相当)
       let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
 
-      sampleColor = mix(transmissionColor, sky, fresnel);
+      var waterColorResult = mix(transmissionColor, sky, fresnel);
+      let viewDir = -rayDir;
+      let glitter = sunGlitter(viewDir, sunDir, shininess) * sunVisibilityOf(sunDir);
+      waterColorResult += vec3<f32>(1.0, 0.95, 0.85) * glitter * glitterIntensity;
+      sampleColor = waterColorResult;
     }
     colorSum += sampleColor;
   }
@@ -359,6 +393,29 @@ async function main() {
     waterColor = hexToRgb(waterColorInput.value);
   });
 
+  // ハイライトの鋭さ(shininess)・強さ(倍率)。鋭さのスライダーは対数的にshininessへ
+  // マッピングする(線形だとハイライトの見た目の変化が高い側に偏ってしまうため)。
+  let highlightShininess = 200.0;
+  let highlightIntensity = 1.5;
+
+  const highlightSharpnessInput = document.getElementById('highlightSharpness');
+  const highlightSharpnessVal = document.getElementById('highlightSharpnessVal');
+  function updateHighlightSharpness() {
+    const t = parseInt(highlightSharpnessInput.value, 10) / 100;
+    highlightShininess = Math.pow(10, 2.0 + t * 3.0); // 100 (滲んだ光) 〜 100000 (ほぼ点像)
+    highlightSharpnessVal.textContent = String(highlightSharpnessInput.value);
+  }
+  highlightSharpnessInput.addEventListener('input', updateHighlightSharpness);
+  updateHighlightSharpness();
+
+  const highlightIntensityInput = document.getElementById('highlightIntensity');
+  const highlightIntensityVal = document.getElementById('highlightIntensityVal');
+  highlightIntensityInput.addEventListener('input', () => {
+    highlightIntensity = parseInt(highlightIntensityInput.value, 10) / 100;
+    highlightIntensityVal.textContent = highlightIntensityInput.value + '%';
+  });
+  highlightIntensity = parseInt(highlightIntensityInput.value, 10) / 100;
+
   // 空のPNGインポート。file://で開いてもCORSに引っかからないよう、fetchではなく
   // ファイル選択ダイアログ(createImageBitmap + copyExternalImageToTexture)で読み込む。
   const skyStatus = document.getElementById('skyStatus');
@@ -389,11 +446,11 @@ async function main() {
     uniformData[0] = canvas.width;
     uniformData[1] = canvas.height;
     uniformData[2] = sunHour;
-    uniformData[3] = 0;
+    uniformData[3] = highlightShininess;
     uniformData[4] = waterColor[0];
     uniformData[5] = waterColor[1];
     uniformData[6] = waterColor[2];
-    uniformData[7] = 0;
+    uniformData[7] = highlightIntensity;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
     const encoder = device.createCommandEncoder();
