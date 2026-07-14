@@ -168,7 +168,7 @@ const traceShaderCode = /* wgsl */ `
 ${vertexShaderCode}
 
 struct Uniforms {
-  resAndSun: vec4<f32>,  // xy = resolution, z = sunHour(太陽の時刻), w = ハイライトのshininess
+  resAndSun: vec4<f32>,  // xy = resolution, z = sunHour(太陽の時刻), w = ハイライト円盤の半径(ラジアン)
   waterColor: vec4<f32>, // rgb = フレネル透過成分の色(水そのものの色), a = ハイライト強度
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -211,22 +211,28 @@ fn sampleSky(dir: vec3<f32>) -> vec3<f32> {
   return textureSampleLevel(envTex, envSampler, uv, 0.0).rgb;
 }
 
-// 太陽方向への明示的なハイライト(shaders/ocean-gerstner.htmlのsunGlitter()と同じ
-// Blinn-Phong方式)。理屈上は完全な鏡面なので、焼き込み画像内の太陽円盤が反射方向に
-// そのまま映り込むだけでも太陽の輝きは表現されるはずだが、equirectテクスチャ上での
-// 太陽の角サイズはわずか数ピクセルしかなく、フレームバッファ解像度・4サンプルのAA・
-// bilinear補間だけでは、カメラの向きによってハイライトが消えたりチラついたりして
-// 安定して見えない。そこでテクスチャの中身に頼らず、sunDir(スライダーの時刻)から
-// 直接ハイライトの明るさを計算し、確実にサンプルできる形で加算する。
-// 水面自体は完全に平らな鏡面のままなので、このハイライトの幅(shininess)は
-// 物理的な「粗さ」ではなく、写真でも実際に観測される(カメラ/眼のレンズや水面の
-// 微小な波によるにじみに相当する)見た目の輝きの広がりを表す演出的なパラメータ。
-fn sunGlitter(viewDir: vec3<f32>, sunDir: vec3<f32>, shininess: f32) -> f32 {
-  let normal = vec3<f32>(0.0, 1.0, 0.0);
-  let halfDir = normalize(viewDir + sunDir);
-  let ndotH = max(dot(normal, halfDir), 0.0);
-  let normalization = (shininess + 2.0) / (2.0 * PI);
-  return normalization * pow(ndotH, shininess);
+// 太陽方向への明示的なハイライト。理屈上は完全な鏡面なので、焼き込み画像内の太陽円盤が
+// 反射方向にそのまま映り込むだけでも太陽の輝きは表現されるはずだが、equirectテクスチャ上
+// での太陽の角サイズはわずか数ピクセルしかなく、フレームバッファ解像度・4サンプルのAA・
+// bilinear補間だけでは、カメラの向きによってハイライトが消えたりチラついたりして安定して
+// 見えない。そこでテクスチャの中身に頼らず、反射方向reflDirと太陽方向sunDirの「なす角」
+// だけで解析的に円盤を描く(shaders/sky-precise.htmlの太陽円盤
+// smoothstep(cos(0.02), cos(0.009), dot(rayDir, sunDir)) と同じ考え方)。
+//
+// 【重要】最初はshaders/ocean-gerstner.htmlのsunGlitter()と同じBlinn-Phong方式
+// (視線と太陽方向のハーフベクトルhalfDir=normalize(view+sun)と法線の内積のべき乗)を
+// そのまま流用したが、これは水面全体に無数の異なる傾きの微小面がある「粗い」水面を
+// 前提にした近似であり、視線が浅い角度になるほどhalfDirと法線のなす角が真の反射角
+// (reflDirとsunDirのなす角)からずれていく性質がある。roughnessゼロの完全な平面に
+// このズレをそのまま持ち込むと、水平線に近づくほどハイライトが手前に間延びした涙形
+// (いわゆる写真の"sun glitter path")になってしまい、平らな鏡面では本来歪まず円形に
+// 映るはずの太陽の形と矛盾する。反射方向と太陽方向の「なす角」だけに依存する円盤の式
+// (下記)に置き換えることで、視線角度によらず常に真円のハイライトになる。
+fn sunDisc(reflDir: vec3<f32>, sunDir: vec3<f32>, outerRadius: f32) -> f32 {
+  let cosAngle = dot(reflDir, sunDir);
+  let cosOuter = cos(outerRadius);
+  let cosInner = cos(outerRadius * 0.45);
+  return smoothstep(cosOuter, cosInner, cosAngle);
 }
 
 @fragment
@@ -235,8 +241,8 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let sunHour = uniforms.resAndSun.z;
   let sunDir = hourToSunDir(sunHour);
   let transmissionColor = uniforms.waterColor.rgb * sunVisibilityOf(sunDir);
-  let shininess = uniforms.resAndSun.w;
-  let glitterIntensity = uniforms.waterColor.a;
+  let highlightRadius = uniforms.resAndSun.w;
+  let highlightIntensity = uniforms.waterColor.a;
 
   // 固定カメラ(水平方向を向く。shaders/ocean-gerstner.htmlと同じ配置)
   let eye = vec3<f32>(0.0, 2.5, 0.0);
@@ -273,9 +279,8 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
       let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
 
       var waterColorResult = mix(transmissionColor, sky, fresnel);
-      let viewDir = -rayDir;
-      let glitter = sunGlitter(viewDir, sunDir, shininess) * sunVisibilityOf(sunDir);
-      waterColorResult += vec3<f32>(1.0, 0.95, 0.85) * glitter * glitterIntensity;
+      let disc = sunDisc(reflDir, sunDir, highlightRadius) * sunVisibilityOf(sunDir);
+      waterColorResult += vec3<f32>(1.0, 0.98, 0.92) * disc * highlightIntensity;
       sampleColor = waterColorResult;
     }
     colorSum += sampleColor;
@@ -393,16 +398,19 @@ async function main() {
     waterColor = hexToRgb(waterColorInput.value);
   });
 
-  // ハイライトの鋭さ(shininess)・強さ(倍率)。鋭さのスライダーは対数的にshininessへ
-  // マッピングする(線形だとハイライトの見た目の変化が高い側に偏ってしまうため)。
-  let highlightShininess = 200.0;
+  // ハイライト円盤の半径(ラジアン)・強さ(倍率)。円盤の半径は反射方向と太陽方向の
+  // 「なす角」だけで決まる(shaders/sky-precise.htmlの太陽円盤と同じ考え方)ため、
+  // 視線角度によらず常に真円になる。鋭さのスライダーは対数的に半径へマッピングする
+  // (線形だとハイライトの見た目の変化が高い側に偏ってしまうため)。最も鋭い側は
+  // sky-precise.htmlの太陽円盤(外側半径0.02ラジアン)とほぼ同じ大きさにしてある。
+  let highlightRadius = 0.05;
   let highlightIntensity = 1.5;
 
   const highlightSharpnessInput = document.getElementById('highlightSharpness');
   const highlightSharpnessVal = document.getElementById('highlightSharpnessVal');
   function updateHighlightSharpness() {
     const t = parseInt(highlightSharpnessInput.value, 10) / 100;
-    highlightShininess = Math.pow(10, 2.0 + t * 3.0); // 100 (滲んだ光) 〜 100000 (ほぼ点像)
+    highlightRadius = Math.pow(10, -1.7 + (1 - t) * 1.0); // 鋭さ100→0.02rad(実際の太陽円盤相当) 〜 鋭さ1→0.2rad(滲んだ光)
     highlightSharpnessVal.textContent = String(highlightSharpnessInput.value);
   }
   highlightSharpnessInput.addEventListener('input', updateHighlightSharpness);
@@ -446,7 +454,7 @@ async function main() {
     uniformData[0] = canvas.width;
     uniformData[1] = canvas.height;
     uniformData[2] = sunHour;
-    uniformData[3] = highlightShininess;
+    uniformData[3] = highlightRadius;
     uniformData[4] = waterColor[0];
     uniformData[5] = waterColor[1];
     uniformData[6] = waterColor[2];
