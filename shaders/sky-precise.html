@@ -475,12 +475,16 @@ struct TraceUniforms {
 
 @fragment
 fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
-  let uv = fragCoord.xy / vec2<f32>(${EQUIRECT_W}.0, ${EQUIRECT_H}.0);
+  let texelIndex = u32(fragCoord.x) + u32(fragCoord.y) * ${EQUIRECT_W}u;
+  var seed = texelIndex * 9781u + u32(traceUniforms.frameIndex) * 6271u + 1u;
+
+  // テクセル内でサブピクセル位置をランダムにジッターさせる。フレームを重ねるほど
+  // テクセルのfootprint全体を平均化することになり(時間積分によるスーパーサンプリング)、
+  // テクセル中心の1方向だけを固定サンプリングすることで生じるエイリアシング/バンディングを防ぐ。
+  let jitter = vec2<f32>(rand(&seed) - 0.5, rand(&seed) - 0.5) / vec2<f32>(${EQUIRECT_W}.0, ${EQUIRECT_H}.0);
+  let uv = fragCoord.xy / vec2<f32>(${EQUIRECT_W}.0, ${EQUIRECT_H}.0) + jitter;
   let dir = equirectUVToDir(uv);
   let sunDir = hourToSunDir(traceUniforms.sunHour);
-
-  let texelIndex = u32(fragCoord.x) + u32(fragCoord.y) * ${EQUIRECT_W}u;
-  let seed = texelIndex * 9781u + u32(traceUniforms.frameIndex) * 6271u + 1u;
 
   let sampleColor = traceSkyPrecise(dir, sunDir, u32(traceUniforms.maxBounces), seed);
 
@@ -505,7 +509,17 @@ struct DirectTraceUniforms {
 @fragment
 fn fs_directTrace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let res = directUniforms.resAndSun.xy;
-  let ndc = (fragCoord.xy - 0.5 * res) / res.y;
+  let sunDir = hourToSunDir(directUniforms.resAndSun.z);
+  let frameIndex = directUniforms.resAndSun.w;
+  let maxBounces = u32(directUniforms.params.x);
+
+  let pixelIndex = u32(fragCoord.x) + u32(fragCoord.y) * u32(res.x);
+  var seed = pixelIndex * 9781u + u32(frameIndex) * 6271u + 1u;
+
+  // ピクセル内でサブピクセル位置をジッターさせ、フレームを重ねるほどピクセルの
+  // footprint全体を平均化する(fs_traceと同じアンチエイリアシング)
+  let jitter = vec2<f32>(rand(&seed) - 0.5, rand(&seed) - 0.5);
+  let ndc = (fragCoord.xy + jitter - 0.5 * res) / res.y;
 
   let forward = normalize(vec3<f32>(0.0, 0.35, -1.0));
   let worldUp = vec3<f32>(0.0, 1.0, 0.0);
@@ -513,13 +527,6 @@ fn fs_directTrace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<
   let up = cross(right, forward);
   let fov = 1.5;
   let dir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
-
-  let sunDir = hourToSunDir(directUniforms.resAndSun.z);
-  let frameIndex = directUniforms.resAndSun.w;
-  let maxBounces = u32(directUniforms.params.x);
-
-  let pixelIndex = u32(fragCoord.x) + u32(fragCoord.y) * u32(res.x);
-  let seed = pixelIndex * 9781u + u32(frameIndex) * 6271u + 1u;
 
   let sampleColor = traceSkyPrecise(dir, sunDir, maxBounces, seed);
 
