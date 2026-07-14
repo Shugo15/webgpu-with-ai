@@ -193,7 +193,7 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f
 // sky-precise.htmlで焼き込んだequirectangular PNGをインポートすると、
 // 多重散乱パストレーシングの空を環境マップとして反射に使える。現実の海は完全な鏡面ではなく少しmatteなので、反射方向を
 // 粗さ(roughness)に応じてランダムに散らす。これによりノイズが乗るため、波を一時停止した状態で
-// フレームを重ねて累積平均を取り(ping-pongさせた2枚のrgba16floatテクスチャ)、時間積分で
+// フレームを重ねて累積平均を取り(ping-pongさせた2枚のrgba32floatテクスチャ)、時間積分で
 // ノイズを収束させる。波が動いている間は毎フレーム新規描画になりノイズが乗ったままになる。
 const traceShaderCode = /* wgsl */ `
 ${vertexShaderCode}
@@ -701,7 +701,9 @@ async function main() {
 
   const context = canvas.getContext('webgpu');
   const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
-  const accumFormat = 'rgba16float';
+  // 蓄積バッファは累積平均の更新量がnに反比例して小さくなるため、rgba16floatだと
+  // n≈2000で更新が量子化幅を下回って凍結し縞(バンディング)が出る(README「落とし穴」参照)。
+  const accumFormat = 'rgba32float';
 
   // 焼き込み空(sky-precise.htmlでエクスポートしたequirectangular PNG)のテクスチャ。
   // インポートされるまでは1x1のプレースホルダ(useEnvSkyフラグが0の間はサンプリングされない)。
