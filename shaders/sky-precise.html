@@ -114,6 +114,11 @@
     <span class="val" id="maxBouncesVal">4</span>
   </div>
   <div class="row">
+    <label for="raymarchSteps">レイマーチステップ数</label>
+    <input id="raymarchSteps" type="range" min="8" max="64" step="1" value="24">
+    <span class="val" id="raymarchStepsVal">24</span>
+  </div>
+  <div class="row">
     <label for="debugMode">表示モード</label>
     <select id="debugMode">
       <option value="0">通常</option>
@@ -146,8 +151,8 @@
 <div id="error"></div>
 
 <script>
-const EQUIRECT_W = 512;
-const EQUIRECT_H = 256;
+const EQUIRECT_W = 1024;
+const EQUIRECT_H = 512;
 
 const commonShaderCode = /* wgsl */ `
 const PI: f32 = 3.14159265;
@@ -258,7 +263,7 @@ fn extinctionAt(pos: vec3<f32>) -> vec3<f32> {
 
 // posから太陽方向への透過率(大気上端まで数値積分)。途中で地面(惑星本体)に
 // 遮られる場合は0を返す。
-fn computeSunTransmittance(pos: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
+fn computeSunTransmittance(pos: vec3<f32>, sunDir: vec3<f32>, steps: u32) -> vec3<f32> {
   let groundT = raySphereIntersect(pos, sunDir, PLANET_RADIUS);
   if (groundT.x > 0.0) {
     return vec3<f32>(0.0);
@@ -266,7 +271,6 @@ fn computeSunTransmittance(pos: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
   let topT = raySphereIntersect(pos, sunDir, ATMOSPHERE_RADIUS);
   let dist = max(topT.y, 0.0);
   // 主レイと同じ理由(水平線に近い太陽ほど距離が桁違いに伸びる)でu^2の非均等刻みにする
-  let steps = 12u;
   var opticalDepth = vec3<f32>(0.0);
   for (var i = 0u; i < steps; i = i + 1u) {
     let u0 = f32(i) / f32(steps);
@@ -331,7 +335,7 @@ fn sampleHGDirection(axis: vec3<f32>, g: f32, seed: ptr<function, u32>) -> vec3<
 // レイリー/ミー散乱/吸収のどれが起きたかを輝度加重で確率的に選び(スペクトル比はthroughputへ
 // 補正として乗算)、(4)Next Event Estimationで太陽方向への直接寄与を加算し、(5)選んだ位相関数から
 // 次方向を重点的サンプリングして継続する。
-fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn: u32) -> vec3<f32> {
+fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn: u32, raymarchSteps: u32) -> vec3<f32> {
   var seed = seedIn;
   var pos = vec3<f32>(0.0, PLANET_RADIUS + CAM_HEIGHT, 0.0);
   var rayDir = dirIn;
@@ -355,7 +359,7 @@ fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn:
     // 水平: 数百km)。均等刻みだと水平線付近でステップ幅が大気の密度変化のスケール
     // (レイリー8km, ミー1.2km)を大きく超えてしまい、積分が破綻する。
     // u(0..1)をu^2で再パラメータ化してカメラに近い側を密に、遠い側を粗く刻む。
-    let numSteps = 24u;
+    let numSteps = raymarchSteps;
     var collided = false;
     var collidePos = pos + rayDir * segEnd;
 
@@ -431,7 +435,7 @@ fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn:
     } else {
       phaseToSun = miePhase(cosToSun, MIE_G);
     }
-    let transmittanceToSun = computeSunTransmittance(collidePos, sunDir);
+    let transmittanceToSun = computeSunTransmittance(collidePos, sunDir, max(raymarchSteps / 2u, 4u));
     radiance += throughput * phaseToSun * transmittanceToSun * SUN_INTENSITY;
 
     var newDir: vec3<f32>;
@@ -468,7 +472,7 @@ struct TraceUniforms {
   sunHour: f32,
   frameIndex: f32,
   maxBounces: f32,
-  _pad: f32,
+  raymarchSteps: f32,
 };
 @group(0) @binding(0) var<uniform> traceUniforms: TraceUniforms;
 @group(0) @binding(1) var prevAccumTex: texture_2d<f32>;
@@ -486,7 +490,7 @@ fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let dir = equirectUVToDir(uv);
   let sunDir = hourToSunDir(traceUniforms.sunHour);
 
-  let sampleColor = traceSkyPrecise(dir, sunDir, u32(traceUniforms.maxBounces), seed);
+  let sampleColor = traceSkyPrecise(dir, sunDir, u32(traceUniforms.maxBounces), seed, u32(traceUniforms.raymarchSteps));
 
   let prev = textureLoad(prevAccumTex, vec2<i32>(i32(fragCoord.x), i32(fragCoord.y)), 0).rgb;
   let n = traceUniforms.frameIndex + 1.0;
@@ -501,7 +505,7 @@ fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 const directTraceShaderCode = commonShaderCode + vertexShaderCode + /* wgsl */ `
 struct DirectTraceUniforms {
   resAndSun: vec4<f32>, // xy=解像度, z=太陽の時刻, w=フレーム数
-  params: vec4<f32>,    // x=最大散乱回数
+  params: vec4<f32>,    // x=最大散乱回数, y=レイマーチステップ数
 };
 @group(0) @binding(0) var<uniform> directUniforms: DirectTraceUniforms;
 @group(0) @binding(1) var prevDirectTex: texture_2d<f32>;
@@ -528,7 +532,8 @@ fn fs_directTrace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<
   let fov = 1.5;
   let dir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
 
-  let sampleColor = traceSkyPrecise(dir, sunDir, maxBounces, seed);
+  let raymarchSteps = u32(directUniforms.params.y);
+  let sampleColor = traceSkyPrecise(dir, sunDir, maxBounces, seed, raymarchSteps);
 
   let prev = textureLoad(prevDirectTex, vec2<i32>(i32(fragCoord.x), i32(fragCoord.y)), 0).rgb;
   let n = frameIndex + 1.0;
@@ -823,6 +828,7 @@ async function main() {
 
   let sunHour = 10.0;
   let maxBounces = 4;
+  let raymarchSteps = 24;
   let frameIndex = 0;
   let liveMode = true; // false: PNGインポート直後で表示が固定されている状態
   let debugMode = 0; // 0=通常 1=輝度ヒートマップ 2=散乱角ヒートマップ 3=denomヒートマップ
@@ -850,6 +856,13 @@ async function main() {
   maxBouncesInput.addEventListener('input', () => {
     maxBounces = parseInt(maxBouncesInput.value, 10);
     maxBouncesVal.textContent = String(maxBounces);
+  });
+
+  const raymarchStepsInput = document.getElementById('raymarchSteps');
+  const raymarchStepsVal = document.getElementById('raymarchStepsVal');
+  raymarchStepsInput.addEventListener('input', () => {
+    raymarchSteps = parseInt(raymarchStepsInput.value, 10);
+    raymarchStepsVal.textContent = String(raymarchSteps);
   });
 
   document.getElementById('debugMode').addEventListener('change', (e) => {
@@ -939,7 +952,7 @@ async function main() {
 
     if (directMode) {
       // equirectテクスチャを介さず、画面解像度のまま直接パストレーシングして蓄積する
-      const directData = new Float32Array([canvas.width, canvas.height, sunHour, directFrameIndex, maxBounces, 0, 0, 0]);
+      const directData = new Float32Array([canvas.width, canvas.height, sunHour, directFrameIndex, maxBounces, raymarchSteps, 0, 0]);
       device.queue.writeBuffer(directTraceUniformBuffer, 0, directData);
 
       const srcIsA = directFrameIndex % 2 === 0;
@@ -982,7 +995,7 @@ async function main() {
     }
 
     if (liveMode) {
-      const traceData = new Float32Array([sunHour, frameIndex, maxBounces, 0]);
+      const traceData = new Float32Array([sunHour, frameIndex, maxBounces, raymarchSteps]);
       device.queue.writeBuffer(traceUniformBuffer, 0, traceData);
 
       const srcIsA = frameIndex % 2 === 0;
