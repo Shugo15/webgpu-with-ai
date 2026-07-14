@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<title>空(高精度・equirectangularテクスチャ焼き込み検証) - WebGPU Shader Playground</title>
+<title>空(高精度・多重散乱パストレーシング) - WebGPU Shader Playground</title>
 <style>
   html, body {
     margin: 0;
@@ -101,28 +101,50 @@
     <span class="val" id="sunHourVal">10:00</span>
   </div>
   <div class="row">
-    <button id="bakeBtn">equirectテクスチャに焼き込む</button>
+    <label for="maxBounces">最大散乱回数</label>
+    <input id="maxBounces" type="range" min="1" max="8" step="1" value="4">
+    <span class="val" id="maxBouncesVal">4</span>
+  </div>
+  <div class="row">
+    <button id="bakeBtn">リセットして焼き込み開始</button>
     <button id="exportBtn">PNGとしてエクスポート</button>
     <button id="importBtn">PNGをインポート</button>
     <input id="importFile" type="file" accept="image/png" style="display:none">
   </div>
   <div id="status"></div>
   <p id="note">
-    画面の左半分は空の式を毎ピクセル直接計算した色、右半分は一度equirectangular(緯度経度)テクスチャに焼き込んでから
-    方向ベクトル→UV変換でサンプリングした色。両者が一致していれば、方向→テクスチャ座標の変換とテクスチャの
-    往復(焼き込み・PNGエクスポート・再インポート)が正しく機能していることが確認できる。
-    現時点では検証のため既存の高速な解析的近似式を焼き込んでいるが、次段階でここを多重散乱パストレーシングに
-    置き換える予定。
+    equirectangular(緯度経度)テクスチャの各テクセル(=方向)に対して、大気を球殻状の層(レイリー散乱・ミー散乱・
+    オゾン吸収、それぞれ高度によって密度が指数関数的/釣鐘状に変化)としてモンテカルロ・パストレーシングし、
+    多重散乱まで含めて物理的に計算する。1フレームにつき1サンプルを蓄積し、フレームを重ねるほどノイズが収束する
+    (これまでのCornell Box/海のシェーダーと同じ時間積分デノイズ)。収束の途中でもいつでもPNGエクスポート/インポート
+    が可能。太陽の時刻を変えると蓄積はリセットされる。
   </p>
 </div>
 <div id="error"></div>
 
 <script>
-const EQUIRECT_W = 1024;
-const EQUIRECT_H = 512;
+const EQUIRECT_W = 512;
+const EQUIRECT_H = 256;
 
 const commonShaderCode = /* wgsl */ `
 const PI: f32 = 3.14159265;
+
+// --- 大気の物理定数(Bruneton & Neyretのprecomputed atmospheric scatteringモデルで
+// 広く使われている値。惑星半径6360km、大気の厚さ60km、レイリー/ミー/オゾンの
+// 消散係数・スケールハイトは実測に基づく代表値) ---
+const PLANET_RADIUS: f32 = 6360000.0;
+const ATMOSPHERE_RADIUS: f32 = 6420000.0;
+const CAM_HEIGHT: f32 = 2.0;
+const RAYLEIGH_SCALE_HEIGHT: f32 = 8000.0;
+const MIE_SCALE_HEIGHT: f32 = 1200.0;
+const RAYLEIGH_SCATTERING = vec3<f32>(5.802e-6, 13.558e-6, 33.1e-6);
+const MIE_SCATTERING: f32 = 3.996e-6;
+const MIE_EXTINCTION: f32 = 4.440e-6;
+const MIE_G: f32 = 0.8;
+const OZONE_ABSORPTION = vec3<f32>(0.650e-6, 1.881e-6, 0.085e-6);
+const OZONE_CENTER_ALTITUDE: f32 = 25000.0;
+const OZONE_WIDTH: f32 = 15000.0;
+const SUN_INTENSITY: f32 = 15.0;
 
 fn rayleighPhase(cosTheta: f32) -> f32 {
   return 3.0 / (16.0 * PI) * (1.0 + cosTheta * cosTheta);
@@ -138,47 +160,6 @@ fn hash21(p: vec2<f32>) -> f32 {
   var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
   p3 = p3 + dot(p3, p3.yzx + 33.33);
   return fract((p3.x + p3.y) * p3.z);
-}
-
-// analytic-sky.htmlと同じ高速近似式。ここでは焼き込み/インポート/エクスポートの
-// パイプライン自体が正しいかを検証するためのプレースホルダーとして使う。
-fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
-  let cosTheta = dot(dir, sunDir);
-
-  let rayleighCoeff = vec3<f32>(0.1, 0.5, 2.0);
-  let mieCoeff = 0.12;
-  let mieG = 0.82;
-  let opticalScale = 0.15;
-
-  let sunVisibility = smoothstep(-0.12, 0.06, sunDir.y);
-
-  if (dir.y < 0.0) {
-    let hazeColor = vec3<f32>(0.55, 0.5, 0.45) * sunVisibility;
-    let groundColor = vec3<f32>(0.02, 0.02, 0.025);
-    return mix(hazeColor, groundColor, smoothstep(0.0, -0.25, dir.y));
-  }
-
-  let viewElevation = max(dir.y, 0.02);
-  let viewExtinction = exp(-(1.0 / viewElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * opticalScale);
-
-  let sunElevation = max(sunDir.y, 0.02);
-  let sunTransmittance = exp(-(1.0 / sunElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * opticalScale);
-
-  let rayleighInscatter = rayleighCoeff * rayleighPhase(cosTheta);
-  let mieInscatter = vec3<f32>(mieCoeff) * miePhase(cosTheta, mieG);
-  let inscatter = (rayleighInscatter + mieInscatter) * viewExtinction * sunTransmittance;
-
-  var col = inscatter * sunVisibility * 10.0;
-
-  let sunDisc = smoothstep(0.9995, 0.9999, cosTheta) * sunVisibility;
-  col += sunTransmittance * sunDisc * 8.0;
-
-  let night = 1.0 - sunVisibility;
-  let starField = step(0.997, hash21(floor(dir.xz * 400.0))) * hash21(dir.xy * 123.4);
-  col += vec3<f32>(starField) * night;
-  col += vec3<f32>(0.008, 0.012, 0.025) * night;
-
-  return col;
 }
 
 fn tonemapGamma(color: vec3<f32>) -> vec3<f32> {
@@ -211,6 +192,221 @@ fn hourToSunDir(hour: f32) -> vec3<f32> {
   let sunAngle = (hour - 6.0) / 12.0 * PI;
   return normalize(vec3<f32>(cos(sunAngle) * 0.35, sin(sunAngle), -0.9));
 }
+
+fn pcgHash(input: u32) -> u32 {
+  var state = input * 747796405u + 2891336453u;
+  var word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+fn rand(seed: ptr<function, u32>) -> f32 {
+  *seed = pcgHash(*seed);
+  return f32(*seed) / 4294967295.0;
+}
+
+fn luminance(v: vec3<f32>) -> f32 {
+  return (v.x + v.y + v.z) / 3.0;
+}
+
+// 惑星中心を原点とした球との交差(t_near, t_far)。交差しなければ(-1,-1)。
+fn raySphereIntersect(ro: vec3<f32>, rd: vec3<f32>, radius: f32) -> vec2<f32> {
+  let b = dot(ro, rd);
+  let c = dot(ro, ro) - radius * radius;
+  let disc = b * b - c;
+  if (disc < 0.0) {
+    return vec2<f32>(-1.0, -1.0);
+  }
+  let sq = sqrt(disc);
+  return vec2<f32>(-b - sq, -b + sq);
+}
+
+fn ozoneDensity(h: f32) -> f32 {
+  return max(0.0, 1.0 - abs(h - OZONE_CENTER_ALTITUDE) / OZONE_WIDTH);
+}
+
+// 位置posでの全消散係数(散乱+吸収、波長ごと)。高度hは惑星中心からの距離から逆算する。
+fn extinctionAt(pos: vec3<f32>) -> vec3<f32> {
+  let h = max(length(pos) - PLANET_RADIUS, 0.0);
+  let rayleigh = RAYLEIGH_SCATTERING * exp(-h / RAYLEIGH_SCALE_HEIGHT);
+  let mie = vec3<f32>(MIE_EXTINCTION) * exp(-h / MIE_SCALE_HEIGHT);
+  let ozone = OZONE_ABSORPTION * ozoneDensity(h);
+  return rayleigh + mie + ozone;
+}
+
+// posから太陽方向への透過率(大気上端まで数値積分)。途中で地面(惑星本体)に
+// 遮られる場合は0を返す。
+fn computeSunTransmittance(pos: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
+  let groundT = raySphereIntersect(pos, sunDir, PLANET_RADIUS);
+  if (groundT.x > 0.0) {
+    return vec3<f32>(0.0);
+  }
+  let topT = raySphereIntersect(pos, sunDir, ATMOSPHERE_RADIUS);
+  let dist = max(topT.y, 0.0);
+  let steps = 8u;
+  let stepSize = dist / f32(steps);
+  var opticalDepth = vec3<f32>(0.0);
+  var t = stepSize * 0.5;
+  for (var i = 0u; i < steps; i = i + 1u) {
+    let samplePos = pos + sunDir * t;
+    opticalDepth += extinctionAt(samplePos) * stepSize;
+    t += stepSize;
+  }
+  return exp(-opticalDepth);
+}
+
+// Duff et al. 2017の分岐無しONB構築。単一の法線からタンジェント基底を作る。
+fn buildBasis(n: vec3<f32>) -> mat3x3<f32> {
+  let s = select(-1.0, 1.0, n.z >= 0.0);
+  let a = -1.0 / (s + n.z);
+  let b = n.x * n.y * a;
+  let tangent = vec3<f32>(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
+  let bitangent = vec3<f32>(b, s + n.y * n.y * a, -n.y);
+  return mat3x3<f32>(tangent, bitangent, n);
+}
+
+fn sampleDirectionAroundAxis(axis: vec3<f32>, cosTheta: f32, seed: ptr<function, u32>) -> vec3<f32> {
+  let sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+  let phi = 2.0 * PI * rand(seed);
+  let localDir = vec3<f32>(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+  let basis = buildBasis(axis);
+  return normalize(basis * localDir);
+}
+
+// レイリー位相関数 3/(16π)(1+cosθ²) を棄却法で重点的サンプリング
+fn sampleRayleighDirection(axis: vec3<f32>, seed: ptr<function, u32>) -> vec3<f32> {
+  var cosTheta = 0.0;
+  for (var i = 0u; i < 20u; i = i + 1u) {
+    let c = 2.0 * rand(seed) - 1.0;
+    let accept = (1.0 + c * c) * 0.5;
+    if (rand(seed) < accept) {
+      cosTheta = c;
+      break;
+    }
+  }
+  return sampleDirectionAroundAxis(axis, cosTheta, seed);
+}
+
+// Henyey-Greenstein位相関数の解析的重点的サンプリング(標準公式)
+fn sampleHGDirection(axis: vec3<f32>, g: f32, seed: ptr<function, u32>) -> vec3<f32> {
+  let u = rand(seed);
+  var cosTheta: f32;
+  if (abs(g) < 0.001) {
+    cosTheta = 1.0 - 2.0 * u;
+  } else {
+    let sqrTerm = (1.0 - g * g) / (1.0 + g - 2.0 * g * u);
+    cosTheta = (1.0 + g * g - sqrTerm * sqrTerm) / (2.0 * g);
+  }
+  return sampleDirectionAroundAxis(axis, cosTheta, seed);
+}
+
+// 大気を球殻の不均質な媒質として扱うモンテカルロ・ボリュームパストレーシング。
+// 各バウンスで: (1)区間長を地面/大気上端との交差から決め、(2)区間内をレイマーチしながら
+// 各ステップの消散率から自由行程(次の衝突点)を指数分布でサンプリングし、(3)衝突したら
+// レイリー/ミー散乱/吸収のどれが起きたかを輝度加重で確率的に選び(スペクトル比はthroughputへ
+// 補正として乗算)、(4)Next Event Estimationで太陽方向への直接寄与を加算し、(5)選んだ位相関数から
+// 次方向を重点的サンプリングして継続する。
+fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn: u32) -> vec3<f32> {
+  var seed = seedIn;
+  var pos = vec3<f32>(0.0, PLANET_RADIUS + CAM_HEIGHT, 0.0);
+  var rayDir = dirIn;
+  var throughput = vec3<f32>(1.0, 1.0, 1.0);
+  var radiance = vec3<f32>(0.0, 0.0, 0.0);
+
+  for (var bounce = 0u; bounce < maxBounces; bounce = bounce + 1u) {
+    let groundT = raySphereIntersect(pos, rayDir, PLANET_RADIUS);
+    let topT = raySphereIntersect(pos, rayDir, ATMOSPHERE_RADIUS);
+    var segEnd: f32;
+    var hitsGround: bool;
+    if (groundT.x > 0.0) {
+      segEnd = groundT.x;
+      hitsGround = true;
+    } else {
+      segEnd = max(topT.y, 0.0);
+      hitsGround = false;
+    }
+
+    let numSteps = 16u;
+    let stepSize = segEnd / f32(numSteps);
+    var collided = false;
+    var collidePos = pos + rayDir * segEnd;
+    var stepStart = 0.0;
+
+    for (var i = 0u; i < numSteps; i = i + 1u) {
+      let midPos = pos + rayDir * (stepStart + stepSize * 0.5);
+      let extLum = max(luminance(extinctionAt(midPos)), 1e-8);
+      let collideProb = 1.0 - exp(-extLum * stepSize);
+      if (rand(&seed) < collideProb) {
+        let u = rand(&seed);
+        let subT = -log(1.0 - u * collideProb) / extLum;
+        collidePos = pos + rayDir * (stepStart + subT);
+        collided = true;
+        break;
+      }
+      stepStart += stepSize;
+    }
+
+    if (!collided) {
+      if (hitsGround) {
+        radiance += throughput * vec3<f32>(0.02, 0.02, 0.025);
+      } else {
+        let cosSun = dot(rayDir, sunDir);
+        let sunDisc = smoothstep(cos(0.02), cos(0.009), cosSun);
+        radiance += throughput * vec3<f32>(1.0, 0.98, 0.92) * sunDisc * SUN_INTENSITY;
+        let isNight = smoothstep(0.05, -0.15, sunDir.y);
+        let starField = step(0.997, hash21(floor(rayDir.xz * 400.0))) * hash21(rayDir.xy * 123.4);
+        radiance += throughput * vec3<f32>(starField) * isNight * 0.5;
+      }
+      break;
+    }
+
+    let h = max(length(collidePos) - PLANET_RADIUS, 0.0);
+    let rayleighScatter = RAYLEIGH_SCATTERING * exp(-h / RAYLEIGH_SCALE_HEIGHT);
+    let mieScatter = vec3<f32>(MIE_SCATTERING) * exp(-h / MIE_SCALE_HEIGHT);
+    let mieAbsorb = vec3<f32>(MIE_EXTINCTION - MIE_SCATTERING) * exp(-h / MIE_SCALE_HEIGHT);
+    let ozoneAbsorb = OZONE_ABSORPTION * ozoneDensity(h);
+
+    let wRayleigh = luminance(rayleighScatter);
+    let wMie = luminance(mieScatter);
+    let wAbsorb = luminance(mieAbsorb) + luminance(ozoneAbsorb);
+    let wTotal = max(wRayleigh + wMie + wAbsorb, 1e-8);
+
+    let pick = rand(&seed) * wTotal;
+    if (pick > wRayleigh + wMie) {
+      break; // 吸収されて終端
+    }
+
+    var isRayleigh = true;
+    if (pick < wRayleigh) {
+      throughput *= rayleighScatter / max(wRayleigh, 1e-8);
+      isRayleigh = true;
+    } else {
+      throughput *= mieScatter / max(wMie, 1e-8);
+      isRayleigh = false;
+    }
+
+    let cosToSun = dot(rayDir, sunDir);
+    var phaseToSun: f32;
+    if (isRayleigh) {
+      phaseToSun = rayleighPhase(cosToSun);
+    } else {
+      phaseToSun = miePhase(cosToSun, MIE_G);
+    }
+    let transmittanceToSun = computeSunTransmittance(collidePos, sunDir);
+    radiance += throughput * phaseToSun * transmittanceToSun * SUN_INTENSITY;
+
+    var newDir: vec3<f32>;
+    if (isRayleigh) {
+      newDir = sampleRayleighDirection(rayDir, &seed);
+    } else {
+      newDir = sampleHGDirection(rayDir, MIE_G, &seed);
+    }
+
+    pos = collidePos;
+    rayDir = newDir;
+  }
+
+  return radiance;
+}
 `;
 
 const vertexShaderCode = /* wgsl */ `
@@ -225,34 +421,59 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f
 }
 `;
 
-// 焼き込みパス: equirectangularテクスチャの各テクセルに対応する方向を逆算し、
-// skyColorを評価してそのままトーンマップ済み(PNGエクスポートを前提としたLDR)の色を書き込む
-const bakeShaderCode = commonShaderCode + vertexShaderCode + /* wgsl */ `
-struct BakeUniforms {
+// 蓄積パス: equirectangularテクスチャの各テクセルにつき1サンプルのパストレースを行い、
+// 前フレームまでの平均(prevAccumTex)と合わせて時間方向の累積平均を更新する(HDR, rgba16float)。
+const traceShaderCode = commonShaderCode + vertexShaderCode + /* wgsl */ `
+struct TraceUniforms {
   sunHour: f32,
-  _pad0: f32,
-  _pad1: f32,
-  _pad2: f32,
+  frameIndex: f32,
+  maxBounces: f32,
+  _pad: f32,
 };
-@group(0) @binding(0) var<uniform> bakeUniforms: BakeUniforms;
+@group(0) @binding(0) var<uniform> traceUniforms: TraceUniforms;
+@group(0) @binding(1) var prevAccumTex: texture_2d<f32>;
 
 @fragment
-fn fs_bake(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let uv = fragCoord.xy / vec2<f32>(${EQUIRECT_W}.0, ${EQUIRECT_H}.0);
   let dir = equirectUVToDir(uv);
-  let sunDir = hourToSunDir(bakeUniforms.sunHour);
-  let color = tonemapGamma(skyColor(dir, sunDir));
-  return vec4<f32>(color, 1.0);
+  let sunDir = hourToSunDir(traceUniforms.sunHour);
+
+  let texelIndex = u32(fragCoord.x) + u32(fragCoord.y) * ${EQUIRECT_W}u;
+  let seed = texelIndex * 9781u + u32(traceUniforms.frameIndex) * 6271u + 1u;
+
+  let sampleColor = traceSkyPrecise(dir, sunDir, u32(traceUniforms.maxBounces), seed);
+
+  let prev = textureLoad(prevAccumTex, vec2<i32>(i32(fragCoord.x), i32(fragCoord.y)), 0).rgb;
+  let n = traceUniforms.frameIndex + 1.0;
+  let newAvg = prev + (sampleColor - prev) / n;
+  return vec4<f32>(newAvg, 1.0);
 }
 `;
 
-// 表示パス: 画面左半分は直接skyColorを計算、右半分は焼き込み済みテクスチャを
-// 方向→UV変換でサンプリングした色。両者が一致するかどうかで変換の正しさを検証する。
+// 解決パス: HDRの蓄積テクスチャをトーンマップ+ガンマ補正してLDR(rgba8unorm)に変換する。
+// このLDRテクスチャが表示用サンプリング・PNGエクスポート・PNGインポートの共通の場になる。
+const resolveShaderCode = vertexShaderCode + /* wgsl */ `
+fn tonemapGamma(color: vec3<f32>) -> vec3<f32> {
+  let mapped = color / (color + vec3<f32>(1.0));
+  return pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+}
+
+@group(0) @binding(0) var resolveSrcTex: texture_2d<f32>;
+
+@fragment
+fn fs_resolve(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let hdr = textureLoad(resolveSrcTex, vec2<i32>(i32(fragCoord.x), i32(fragCoord.y)), 0).rgb;
+  return vec4<f32>(tonemapGamma(hdr), 1.0);
+}
+`;
+
+// 表示パス: カメラのレイ方向をequirectangular UVに変換し、解決済みLDRテクスチャをサンプリングするだけ。
 const displayShaderCode = commonShaderCode + vertexShaderCode + /* wgsl */ `
 struct DisplayUniforms {
   iResolution: vec2<f32>,
-  sunHour: f32,
-  _pad: f32,
+  _pad0: f32,
+  _pad1: f32,
 };
 @group(0) @binding(0) var<uniform> displayUniforms: DisplayUniforms;
 @group(0) @binding(1) var equirectTex: texture_2d<f32>;
@@ -270,22 +491,9 @@ fn fs_display(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32>
   let fov = 1.5;
   let dir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
 
-  let sunDir = hourToSunDir(displayUniforms.sunHour);
-
-  // 中央の縦線(1px程度)は境界の目印
-  let splitX = fragCoord.x / res.x;
-  if (abs(splitX - 0.5) < 0.0015) {
-    return vec4<f32>(1.0, 1.0, 0.0, 1.0);
-  }
-
-  if (splitX < 0.5) {
-    let direct = tonemapGamma(skyColor(dir, sunDir));
-    return vec4<f32>(direct, 1.0);
-  } else {
-    let uv = dirToEquirectUV(dir);
-    let sampled = textureSampleLevel(equirectTex, equirectSampler, uv, 0.0).rgb;
-    return vec4<f32>(sampled, 1.0);
-  }
+  let uv = dirToEquirectUV(dir);
+  let sampled = textureSampleLevel(equirectTex, equirectSampler, uv, 0.0).rgb;
+  return vec4<f32>(sampled, 1.0);
 }
 `;
 
@@ -320,7 +528,23 @@ async function main() {
   window.addEventListener('resize', resizeCanvas);
   resizeCanvas();
 
-  // --- equirectangularテクスチャ(焼き込み先 / インポート先 / サンプリング元を兼ねる) ---
+  const accumFormat = 'rgba16float';
+
+  // --- HDR蓄積テクスチャ(ping-pong) ---
+  let accumTexA = device.createTexture({
+    size: [EQUIRECT_W, EQUIRECT_H],
+    format: accumFormat,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+  });
+  let accumTexB = device.createTexture({
+    size: [EQUIRECT_W, EQUIRECT_H],
+    format: accumFormat,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+  });
+  let accumViewA = accumTexA.createView();
+  let accumViewB = accumTexB.createView();
+
+  // --- 表示/エクスポート/インポート共通のLDRテクスチャ ---
   let equirectTexture = device.createTexture({
     size: [EQUIRECT_W, EQUIRECT_H],
     format: 'rgba8unorm',
@@ -334,21 +558,48 @@ async function main() {
     addressModeV: 'clamp-to-edge',
   });
 
-  // --- 焼き込みパイプライン ---
-  const bakeModule = device.createShaderModule({ code: bakeShaderCode });
-  const bakePipeline = device.createRenderPipeline({
+  // --- 蓄積(パストレース)パイプライン ---
+  const traceModule = device.createShaderModule({ code: traceShaderCode });
+  const tracePipeline = device.createRenderPipeline({
     layout: 'auto',
-    vertex: { module: bakeModule, entryPoint: 'vs_main' },
-    fragment: { module: bakeModule, entryPoint: 'fs_bake', targets: [{ format: 'rgba8unorm' }] },
+    vertex: { module: traceModule, entryPoint: 'vs_main' },
+    fragment: { module: traceModule, entryPoint: 'fs_trace', targets: [{ format: accumFormat }] },
     primitive: { topology: 'triangle-list' },
   });
-  const bakeUniformBuffer = device.createBuffer({
+  const traceUniformBuffer = device.createBuffer({
     size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  const bakeBindGroup = device.createBindGroup({
-    layout: bakePipeline.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: bakeUniformBuffer } }],
+  const traceBindGroupSrcA = device.createBindGroup({
+    layout: tracePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: traceUniformBuffer } },
+      { binding: 1, resource: accumViewA },
+    ],
+  });
+  const traceBindGroupSrcB = device.createBindGroup({
+    layout: tracePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: traceUniformBuffer } },
+      { binding: 1, resource: accumViewB },
+    ],
+  });
+
+  // --- 解決(トーンマップ)パイプライン ---
+  const resolveModule = device.createShaderModule({ code: resolveShaderCode });
+  const resolvePipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: resolveModule, entryPoint: 'vs_main' },
+    fragment: { module: resolveModule, entryPoint: 'fs_resolve', targets: [{ format: 'rgba8unorm' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const resolveBindGroupFromA = device.createBindGroup({
+    layout: resolvePipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: accumViewA }],
+  });
+  const resolveBindGroupFromB = device.createBindGroup({
+    layout: resolvePipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: accumViewB }],
   });
 
   // --- 表示パイプライン ---
@@ -376,48 +627,9 @@ async function main() {
   let displayBindGroup = makeDisplayBindGroup();
 
   let sunHour = 10.0;
-  function bake() {
-    const data = new Float32Array([sunHour, 0, 0, 0]);
-    device.queue.writeBuffer(bakeUniformBuffer, 0, data);
-
-    const encoder = device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: equirectTexture.createView(),
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        loadOp: 'clear',
-        storeOp: 'store',
-      }],
-    });
-    pass.setPipeline(bakePipeline);
-    pass.setBindGroup(0, bakeBindGroup);
-    pass.draw(3);
-    pass.end();
-    device.queue.submit([encoder.finish()]);
-    setStatus('焼き込み完了 (太陽の時刻 ' + formatHour(sunHour) + ')');
-  }
-
-  function frame() {
-    const data = new Float32Array([canvas.width, canvas.height, sunHour, 0]);
-    device.queue.writeBuffer(displayUniformBuffer, 0, data);
-
-    const encoder = device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: context.getCurrentTexture().createView(),
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        loadOp: 'clear',
-        storeOp: 'store',
-      }],
-    });
-    pass.setPipeline(displayPipeline);
-    pass.setBindGroup(0, displayBindGroup);
-    pass.draw(3);
-    pass.end();
-    device.queue.submit([encoder.finish()]);
-
-    requestAnimationFrame(frame);
-  }
+  let maxBounces = 4;
+  let frameIndex = 0;
+  let liveMode = true; // false: PNGインポート直後で表示が固定されている状態
 
   function formatHour(h) {
     const hh = Math.floor(h);
@@ -436,7 +648,18 @@ async function main() {
     sunHourVal.textContent = formatHour(sunHour);
   });
 
-  document.getElementById('bakeBtn').addEventListener('click', bake);
+  const maxBouncesInput = document.getElementById('maxBounces');
+  const maxBouncesVal = document.getElementById('maxBouncesVal');
+  maxBouncesInput.addEventListener('input', () => {
+    maxBounces = parseInt(maxBouncesInput.value, 10);
+    maxBouncesVal.textContent = String(maxBounces);
+  });
+
+  document.getElementById('bakeBtn').addEventListener('click', () => {
+    frameIndex = 0;
+    liveMode = true;
+    setStatus('太陽の時刻 ' + formatHour(sunHour) + ' で焼き込みを開始しました');
+  });
 
   document.getElementById('exportBtn').addEventListener('click', async () => {
     setStatus('エクスポート中...');
@@ -471,7 +694,7 @@ async function main() {
       a.download = 'sky-equirect.png';
       a.click();
       URL.revokeObjectURL(url);
-      setStatus('sky-equirect.png をエクスポートしました');
+      setStatus('sky-equirect.png をエクスポートしました (サンプル数 ' + frameIndex + ')');
     }, 'image/png');
   });
 
@@ -483,7 +706,6 @@ async function main() {
     setStatus('インポート中...');
     const bitmap = await createImageBitmap(file);
 
-    // インポートした画像の解像度がベイク先と異なる場合はテクスチャを作り直す
     if (bitmap.width !== equirectTexture.width || bitmap.height !== equirectTexture.height) {
       equirectTexture.destroy();
       equirectTexture = device.createTexture({
@@ -500,11 +722,74 @@ async function main() {
       { texture: equirectTexture },
       [bitmap.width, bitmap.height],
     );
+    liveMode = false; // 次にリセットして焼き込みを開始するまで、インポートした内容を固定表示する
     setStatus('sky-equirect.png をインポートしました (' + bitmap.width + 'x' + bitmap.height + ')');
     importFileInput.value = '';
   });
 
-  bake();
+  function frame() {
+    const encoder = device.createCommandEncoder();
+
+    if (liveMode) {
+      const traceData = new Float32Array([sunHour, frameIndex, maxBounces, 0]);
+      device.queue.writeBuffer(traceUniformBuffer, 0, traceData);
+
+      const srcIsA = frameIndex % 2 === 0;
+      const traceBindGroup = srcIsA ? traceBindGroupSrcA : traceBindGroupSrcB;
+      const dstView = srcIsA ? accumViewB : accumViewA;
+      const resolveBindGroup = srcIsA ? resolveBindGroupFromB : resolveBindGroupFromA;
+
+      const tracePass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: dstView,
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      tracePass.setPipeline(tracePipeline);
+      tracePass.setBindGroup(0, traceBindGroup);
+      tracePass.draw(3);
+      tracePass.end();
+
+      const resolvePass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: equirectTexture.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      resolvePass.setPipeline(resolvePipeline);
+      resolvePass.setBindGroup(0, resolveBindGroup);
+      resolvePass.draw(3);
+      resolvePass.end();
+
+      frameIndex += 1;
+      setStatus('蓄積中... サンプル数 ' + frameIndex + ' (太陽の時刻 ' + formatHour(sunHour) + ')');
+    }
+
+    const displayData = new Float32Array([canvas.width, canvas.height, 0, 0]);
+    device.queue.writeBuffer(displayUniformBuffer, 0, displayData);
+
+    const displayPass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    displayPass.setPipeline(displayPipeline);
+    displayPass.setBindGroup(0, displayBindGroup);
+    displayPass.draw(3);
+    displayPass.end();
+
+    device.queue.submit([encoder.finish()]);
+
+    requestAnimationFrame(frame);
+  }
+
   requestAnimationFrame(frame);
 }
 
