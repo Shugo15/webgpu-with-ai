@@ -669,7 +669,12 @@ async function main() {
   window.addEventListener('resize', resizeCanvas);
   resizeCanvas();
 
-  const accumFormat = 'rgba16float';
+  // 蓄積バッファは32bit float必須。16bit(rgba16float)だと、累積平均の1回あたりの
+  // 更新量 (sample - prev)/n がn≈2000あたりでf16の量子化幅(相対2^-11)を下回り、
+  // 更新が丸めで消えて平均が凍結する。凍結値はf16グリッドに吸着するため、滑らかな
+  // グラデーション上では等高線状の縞(バンディング)として現れる(サンプル数を増やすほど
+  // 周囲のノイズが収束して縞だけが浮かび上がる)。f32なら仮数24bitなので実用上問題ない。
+  const accumFormat = 'rgba32float';
 
   // --- HDR蓄積テクスチャ(ping-pong) ---
   let accumTexA = device.createTexture({
