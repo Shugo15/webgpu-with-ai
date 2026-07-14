@@ -114,3 +114,7 @@ inscatter = (rayleighCoeff*rayleighPhase + mieCoeff*miePhase) * viewExtinction *
 原因は、テストに使った視線方向・太陽方向のベクトルが、実際のカメラの向き(`forward = normalize(vec3(0, 0.35, -1))`)や太陽の軌道式(`sunDir = normalize(vec3(cos(sunAngle)*0.35, sin(sunAngle), -0.9))`)とかけ離れた、自分で適当に決めた値だったこと。特に「正午」のテストでは太陽の仰角を`sunDir.y ≈ 1`(真上)と仮定していたが、実際の軌道式では太陽が単純な円運動ではなく`z`成分が固定なので、正規化後の最大仰角は`0.74`程度にしかならない。テスト用のベクトルと実際にレンダリングされる視線・太陽の位置関係(特に`dot(視線, 太陽方向)`の値)がずれていたため、そのテストに対して最適化したパラメータは実際の画面には通用しなかった。
 
 対策として、実際のカメラの基底ベクトル(`forward`/`right`/`up`)と太陽の軌道式をNode.js側にもそのまま複製し、実際に画面に表示される方向(画面中央など)でパラメータを検証し直した。**シェーダーの一部分だけを単体テストする場合、その入力(視線方向や太陽方向など)が実際のレンダリングで発生する値の範囲を代表しているか確認しないと、テストで良い結果が出てもそれは実物とは無関係な結果になりうる**、という教訓。
+
+### `textureSample`をピクセルごとに分岐する処理の中で呼んでコンパイルエラー(`shaders/sky-precise.html`)
+
+equirectangularテクスチャに焼き込んだ空とその場で直接計算した空を画面の左右半分ずつ表示して見比べる検証用シェーダーで、`if (splitX < 0.5) { ... } else { let sampled = textureSample(...); }`のように`@builtin(position)`(ピクセルごとに異なる非uniformな値)に依存する分岐の中で`textureSample`を呼んだところ、`'textureSample' must only be called from uniform control flow`というコンパイルエラーになった。`textureSample`はミップマップレベル選択のために近傍ピクセルとの微分(dpdx/dpdy)を暗黙に計算するため、ワープ内の全ピクセルが同じ分岐を通ることが保証されない箇所では呼べない、というWGSL(というよりGPUのderivative命令一般)の制約。今回はミップマップ自体不要なので、LODを明示的に指定する`textureSampleLevel(tex, sampler, uv, 0.0)`に置き換えることで解決した。任意の分岐の中でテクスチャサンプリングしたい場合は`textureSampleLevel`を使うのが安全。

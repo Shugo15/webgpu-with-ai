@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>空(高精度・equirectangularテクスチャ焼き込み検証) - WebGPU Shader Playground</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    min-height: 100%;
+    background: #0b0b0f;
+    color: #eee;
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  canvas {
+    display: block;
+    width: min(100vw, 70vh);
+    height: min(100vw, 70vh);
+    background: #000;
+    margin-top: 3.5rem;
+  }
+  #back {
+    position: fixed;
+    top: 1rem;
+    left: 1rem;
+    z-index: 10;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.5);
+    font-size: 0.9rem;
+    text-decoration: none;
+    padding: 0.4rem 0.8rem;
+    border-radius: 6px;
+  }
+  #back:hover {
+    background: rgba(0, 0, 0, 0.75);
+  }
+  #panel {
+    width: min(100vw, 70vh);
+    box-sizing: border-box;
+    padding: 1rem;
+    font-size: 0.85rem;
+  }
+  #panel .row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.6rem;
+  }
+  #panel label {
+    min-width: 8.5rem;
+  }
+  #panel input[type="range"] {
+    flex: 1;
+  }
+  #panel button {
+    background: #23232e;
+    border: 1px solid #3a3a48;
+    color: #eee;
+    padding: 0.4rem 0.8rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  #panel button:hover {
+    background: #2c2c38;
+  }
+  #status {
+    color: #9d9;
+    white-space: pre-wrap;
+    font-size: 0.8rem;
+    min-height: 1.2em;
+  }
+  #note {
+    color: #999;
+    font-size: 0.8rem;
+    line-height: 1.5;
+  }
+  #error {
+    display: none;
+    position: fixed;
+    inset: 0;
+    color: #fff;
+    background: #111;
+    padding: 2rem;
+    box-sizing: border-box;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<a id="back" href="../index.html">&larr; 一覧に戻る</a>
+<canvas id="gpuCanvas"></canvas>
+<div id="panel">
+  <div class="row">
+    <label for="sunHour">太陽の時刻(焼き込み時に固定)</label>
+    <input id="sunHour" type="range" min="0" max="24" step="0.1" value="10">
+    <span class="val" id="sunHourVal">10:00</span>
+  </div>
+  <div class="row">
+    <button id="bakeBtn">equirectテクスチャに焼き込む</button>
+    <button id="exportBtn">PNGとしてエクスポート</button>
+    <button id="importBtn">PNGをインポート</button>
+    <input id="importFile" type="file" accept="image/png" style="display:none">
+  </div>
+  <div id="status"></div>
+  <p id="note">
+    画面の左半分は空の式を毎ピクセル直接計算した色、右半分は一度equirectangular(緯度経度)テクスチャに焼き込んでから
+    方向ベクトル→UV変換でサンプリングした色。両者が一致していれば、方向→テクスチャ座標の変換とテクスチャの
+    往復(焼き込み・PNGエクスポート・再インポート)が正しく機能していることが確認できる。
+    現時点では検証のため既存の高速な解析的近似式を焼き込んでいるが、次段階でここを多重散乱パストレーシングに
+    置き換える予定。
+  </p>
+</div>
+<div id="error"></div>
+
+<script>
+const EQUIRECT_W = 1024;
+const EQUIRECT_H = 512;
+
+const commonShaderCode = /* wgsl */ `
+const PI: f32 = 3.14159265;
+
+fn rayleighPhase(cosTheta: f32) -> f32 {
+  return 3.0 / (16.0 * PI) * (1.0 + cosTheta * cosTheta);
+}
+
+fn miePhase(cosTheta: f32, g: f32) -> f32 {
+  let g2 = g * g;
+  let denom = 1.0 + g2 - 2.0 * g * cosTheta;
+  return (1.0 - g2) / (4.0 * PI * pow(max(denom, 1e-4), 1.5));
+}
+
+fn hash21(p: vec2<f32>) -> f32 {
+  var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+  p3 = p3 + dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+// analytic-sky.htmlと同じ高速近似式。ここでは焼き込み/インポート/エクスポートの
+// パイプライン自体が正しいかを検証するためのプレースホルダーとして使う。
+fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
+  let cosTheta = dot(dir, sunDir);
+
+  let rayleighCoeff = vec3<f32>(0.1, 0.5, 2.0);
+  let mieCoeff = 0.12;
+  let mieG = 0.82;
+  let opticalScale = 0.15;
+
+  let sunVisibility = smoothstep(-0.12, 0.06, sunDir.y);
+
+  if (dir.y < 0.0) {
+    let hazeColor = vec3<f32>(0.55, 0.5, 0.45) * sunVisibility;
+    let groundColor = vec3<f32>(0.02, 0.02, 0.025);
+    return mix(hazeColor, groundColor, smoothstep(0.0, -0.25, dir.y));
+  }
+
+  let viewElevation = max(dir.y, 0.02);
+  let viewExtinction = exp(-(1.0 / viewElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * opticalScale);
+
+  let sunElevation = max(sunDir.y, 0.02);
+  let sunTransmittance = exp(-(1.0 / sunElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * opticalScale);
+
+  let rayleighInscatter = rayleighCoeff * rayleighPhase(cosTheta);
+  let mieInscatter = vec3<f32>(mieCoeff) * miePhase(cosTheta, mieG);
+  let inscatter = (rayleighInscatter + mieInscatter) * viewExtinction * sunTransmittance;
+
+  var col = inscatter * sunVisibility * 10.0;
+
+  let sunDisc = smoothstep(0.9995, 0.9999, cosTheta) * sunVisibility;
+  col += sunTransmittance * sunDisc * 8.0;
+
+  let night = 1.0 - sunVisibility;
+  let starField = step(0.997, hash21(floor(dir.xz * 400.0))) * hash21(dir.xy * 123.4);
+  col += vec3<f32>(starField) * night;
+  col += vec3<f32>(0.008, 0.012, 0.025) * night;
+
+  return col;
+}
+
+fn tonemapGamma(color: vec3<f32>) -> vec3<f32> {
+  let mapped = color / (color + vec3<f32>(1.0));
+  return pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+}
+
+// 方向ベクトル(y=上)からequirectangular(緯度経度)テクスチャのUVへ変換。
+// u: 方位角(0..2PIを0..1に), v: 天頂からの角度(0=真上..1=真下)
+fn dirToEquirectUV(dir: vec3<f32>) -> vec2<f32> {
+  let phi = atan2(dir.z, dir.x);
+  let theta = acos(clamp(dir.y, -1.0, 1.0));
+  let u = phi / (2.0 * PI) + 0.5;
+  let v = theta / PI;
+  return vec2<f32>(u, v);
+}
+
+// UV(equirectangular)から方向ベクトルへの逆変換(焼き込み時に使用)
+fn equirectUVToDir(uv: vec2<f32>) -> vec3<f32> {
+  let phi = (uv.x - 0.5) * 2.0 * PI;
+  let theta = uv.y * PI;
+  let sinTheta = sin(theta);
+  let y = cos(theta);
+  let x = sinTheta * cos(phi);
+  let z = sinTheta * sin(phi);
+  return normalize(vec3<f32>(x, y, z));
+}
+
+fn hourToSunDir(hour: f32) -> vec3<f32> {
+  let sunAngle = (hour - 6.0) / 12.0 * PI;
+  return normalize(vec3<f32>(cos(sunAngle) * 0.35, sin(sunAngle), -0.9));
+}
+`;
+
+const vertexShaderCode = /* wgsl */ `
+@vertex
+fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0)
+  );
+  return vec4<f32>(pos[vertexIndex], 0.0, 1.0);
+}
+`;
+
+// 焼き込みパス: equirectangularテクスチャの各テクセルに対応する方向を逆算し、
+// skyColorを評価してそのままトーンマップ済み(PNGエクスポートを前提としたLDR)の色を書き込む
+const bakeShaderCode = commonShaderCode + vertexShaderCode + /* wgsl */ `
+struct BakeUniforms {
+  sunHour: f32,
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
+};
+@group(0) @binding(0) var<uniform> bakeUniforms: BakeUniforms;
+
+@fragment
+fn fs_bake(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = fragCoord.xy / vec2<f32>(${EQUIRECT_W}.0, ${EQUIRECT_H}.0);
+  let dir = equirectUVToDir(uv);
+  let sunDir = hourToSunDir(bakeUniforms.sunHour);
+  let color = tonemapGamma(skyColor(dir, sunDir));
+  return vec4<f32>(color, 1.0);
+}
+`;
+
+// 表示パス: 画面左半分は直接skyColorを計算、右半分は焼き込み済みテクスチャを
+// 方向→UV変換でサンプリングした色。両者が一致するかどうかで変換の正しさを検証する。
+const displayShaderCode = commonShaderCode + vertexShaderCode + /* wgsl */ `
+struct DisplayUniforms {
+  iResolution: vec2<f32>,
+  sunHour: f32,
+  _pad: f32,
+};
+@group(0) @binding(0) var<uniform> displayUniforms: DisplayUniforms;
+@group(0) @binding(1) var equirectTex: texture_2d<f32>;
+@group(0) @binding(2) var equirectSampler: sampler;
+
+@fragment
+fn fs_display(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let res = displayUniforms.iResolution;
+  let ndc = (fragCoord.xy - 0.5 * res) / res.y;
+
+  let forward = normalize(vec3<f32>(0.0, 0.35, -1.0));
+  let worldUp = vec3<f32>(0.0, 1.0, 0.0);
+  let right = normalize(cross(forward, worldUp));
+  let up = cross(right, forward);
+  let fov = 1.5;
+  let dir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
+
+  let sunDir = hourToSunDir(displayUniforms.sunHour);
+
+  // 中央の縦線(1px程度)は境界の目印
+  let splitX = fragCoord.x / res.x;
+  if (abs(splitX - 0.5) < 0.0015) {
+    return vec4<f32>(1.0, 1.0, 0.0, 1.0);
+  }
+
+  if (splitX < 0.5) {
+    let direct = tonemapGamma(skyColor(dir, sunDir));
+    return vec4<f32>(direct, 1.0);
+  } else {
+    let uv = dirToEquirectUV(dir);
+    let sampled = textureSampleLevel(equirectTex, equirectSampler, uv, 0.0).rgb;
+    return vec4<f32>(sampled, 1.0);
+  }
+}
+`;
+
+async function main() {
+  const canvas = document.getElementById('gpuCanvas');
+  const statusEl = document.getElementById('status');
+
+  if (!navigator.gpu) {
+    showError('このブラウザはWebGPUに対応していません。\nChrome/Edge の最新版などでお試しください。');
+    return;
+  }
+
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    showError('WebGPUアダプタの取得に失敗しました。');
+    return;
+  }
+  const device = await adapter.requestDevice();
+  device.lost.then((info) => console.log('WebGPU device lost:', info.reason, info.message));
+
+  const context = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+
+  function resizeCanvas() {
+    const dpr = window.devicePixelRatio || 1;
+    const cssSize = Math.min(window.innerWidth, window.innerHeight * (7 / 10));
+    const size = Math.max(1, Math.floor(cssSize * dpr));
+    canvas.width = size;
+    canvas.height = size;
+    context.configure({ device, format, alphaMode: 'opaque' });
+  }
+  window.addEventListener('resize', resizeCanvas);
+  resizeCanvas();
+
+  // --- equirectangularテクスチャ(焼き込み先 / インポート先 / サンプリング元を兼ねる) ---
+  let equirectTexture = device.createTexture({
+    size: [EQUIRECT_W, EQUIRECT_H],
+    format: 'rgba8unorm',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT |
+           GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
+  });
+  const equirectSampler = device.createSampler({
+    magFilter: 'linear',
+    minFilter: 'linear',
+    addressModeU: 'repeat',
+    addressModeV: 'clamp-to-edge',
+  });
+
+  // --- 焼き込みパイプライン ---
+  const bakeModule = device.createShaderModule({ code: bakeShaderCode });
+  const bakePipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: bakeModule, entryPoint: 'vs_main' },
+    fragment: { module: bakeModule, entryPoint: 'fs_bake', targets: [{ format: 'rgba8unorm' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const bakeUniformBuffer = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  const bakeBindGroup = device.createBindGroup({
+    layout: bakePipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: bakeUniformBuffer } }],
+  });
+
+  // --- 表示パイプライン ---
+  const displayModule = device.createShaderModule({ code: displayShaderCode });
+  const displayPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: displayModule, entryPoint: 'vs_main' },
+    fragment: { module: displayModule, entryPoint: 'fs_display', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const displayUniformBuffer = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  function makeDisplayBindGroup() {
+    return device.createBindGroup({
+      layout: displayPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: displayUniformBuffer } },
+        { binding: 1, resource: equirectTexture.createView() },
+        { binding: 2, resource: equirectSampler },
+      ],
+    });
+  }
+  let displayBindGroup = makeDisplayBindGroup();
+
+  let sunHour = 10.0;
+  function bake() {
+    const data = new Float32Array([sunHour, 0, 0, 0]);
+    device.queue.writeBuffer(bakeUniformBuffer, 0, data);
+
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: equirectTexture.createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    pass.setPipeline(bakePipeline);
+    pass.setBindGroup(0, bakeBindGroup);
+    pass.draw(3);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    setStatus('焼き込み完了 (太陽の時刻 ' + formatHour(sunHour) + ')');
+  }
+
+  function frame() {
+    const data = new Float32Array([canvas.width, canvas.height, sunHour, 0]);
+    device.queue.writeBuffer(displayUniformBuffer, 0, data);
+
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    pass.setPipeline(displayPipeline);
+    pass.setBindGroup(0, displayBindGroup);
+    pass.draw(3);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+
+    requestAnimationFrame(frame);
+  }
+
+  function formatHour(h) {
+    const hh = Math.floor(h);
+    const mm = Math.round((h - hh) * 60);
+    return String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+  }
+
+  function setStatus(msg) {
+    statusEl.textContent = msg;
+  }
+
+  const sunHourInput = document.getElementById('sunHour');
+  const sunHourVal = document.getElementById('sunHourVal');
+  sunHourInput.addEventListener('input', () => {
+    sunHour = parseFloat(sunHourInput.value);
+    sunHourVal.textContent = formatHour(sunHour);
+  });
+
+  document.getElementById('bakeBtn').addEventListener('click', bake);
+
+  document.getElementById('exportBtn').addEventListener('click', async () => {
+    setStatus('エクスポート中...');
+    const bytesPerRow = EQUIRECT_W * 4;
+    const buffer = device.createBuffer({
+      size: bytesPerRow * EQUIRECT_H,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const encoder = device.createCommandEncoder();
+    encoder.copyTextureToBuffer(
+      { texture: equirectTexture },
+      { buffer, bytesPerRow },
+      [EQUIRECT_W, EQUIRECT_H],
+    );
+    device.queue.submit([encoder.finish()]);
+    await buffer.mapAsync(GPUMapMode.READ);
+    const pixels = new Uint8ClampedArray(buffer.getMappedRange().slice(0));
+    buffer.unmap();
+    buffer.destroy();
+
+    const offscreen = document.createElement('canvas');
+    offscreen.width = EQUIRECT_W;
+    offscreen.height = EQUIRECT_H;
+    const ctx2d = offscreen.getContext('2d');
+    const imageData = new ImageData(pixels, EQUIRECT_W, EQUIRECT_H);
+    ctx2d.putImageData(imageData, 0, 0);
+
+    offscreen.toBlob((blob) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'sky-equirect.png';
+      a.click();
+      URL.revokeObjectURL(url);
+      setStatus('sky-equirect.png をエクスポートしました');
+    }, 'image/png');
+  });
+
+  const importFileInput = document.getElementById('importFile');
+  document.getElementById('importBtn').addEventListener('click', () => importFileInput.click());
+  importFileInput.addEventListener('change', async () => {
+    const file = importFileInput.files[0];
+    if (!file) return;
+    setStatus('インポート中...');
+    const bitmap = await createImageBitmap(file);
+
+    // インポートした画像の解像度がベイク先と異なる場合はテクスチャを作り直す
+    if (bitmap.width !== equirectTexture.width || bitmap.height !== equirectTexture.height) {
+      equirectTexture.destroy();
+      equirectTexture = device.createTexture({
+        size: [bitmap.width, bitmap.height],
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT |
+               GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
+      });
+      displayBindGroup = makeDisplayBindGroup();
+    }
+
+    device.queue.copyExternalImageToTexture(
+      { source: bitmap, flipY: false },
+      { texture: equirectTexture },
+      [bitmap.width, bitmap.height],
+    );
+    setStatus('sky-equirect.png をインポートしました (' + bitmap.width + 'x' + bitmap.height + ')');
+    importFileInput.value = '';
+  });
+
+  bake();
+  requestAnimationFrame(frame);
+}
+
+function showError(message) {
+  const el = document.getElementById('error');
+  el.textContent = message;
+  el.style.display = 'block';
+}
+
+main().catch((err) => {
+  console.error(err);
+  showError('エラーが発生しました:\n' + err.message);
+});
+</script>
+</body>
+</html>
