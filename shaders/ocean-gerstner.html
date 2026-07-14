@@ -145,6 +145,16 @@
     <input id="waterColor" type="color" value="#04174d">
   </div>
   <div class="row">
+    <button id="importSkyButton" type="button">焼き込み空(PNG)をインポート</button>
+  </div>
+  <div class="row">
+    <label for="useEnvSky">インポートした空を使う</label>
+    <input id="useEnvSky" type="checkbox" disabled>
+  </div>
+  <div class="row" id="envSkyNote" style="display:none;color:#9c9;">
+    <span>※太陽の時刻スライダーを焼き込み時の時刻に合わせると、グリッター・透過色が空と整合します</span>
+  </div>
+  <div class="row">
     <label for="debugHighlight">失敗箇所を強調表示</label>
     <input id="debugHighlight" type="checkbox">
   </div>
@@ -160,6 +170,7 @@
     <span>モバイル検出: 負荷軽減のため解像度/上限を下げています</span>
   </div>
 </div>
+<input id="importSkyFile" type="file" accept="image/png" style="display:none">
 <canvas id="gpuCanvas"></canvas>
 <div id="error"></div>
 
@@ -177,8 +188,10 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f
 }
 `;
 
-// 海面をガーストナー波(トロコイド変位)で表現し、空の色(前回の大気散乱近似と同じモデル)を
-// フレネル反射+透過色で描画する。現実の海は完全な鏡面ではなく少しmatteなので、反射方向を
+// 海面をガーストナー波(トロコイド変位)で表現し、空の色をフレネル反射+透過色で描画する。
+// 空は既定では解析的な大気散乱近似(analytic-sky.htmlと同じモデル)だが、
+// sky-precise.htmlで焼き込んだequirectangular PNGをインポートすると、
+// 多重散乱パストレーシングの空を環境マップとして反射に使える。現実の海は完全な鏡面ではなく少しmatteなので、反射方向を
 // 粗さ(roughness)に応じてランダムに散らす。これによりノイズが乗るため、波を一時停止した状態で
 // フレームを重ねて累積平均を取り(ping-pongさせた2枚のrgba16floatテクスチャ)、時間積分で
 // ノイズを収束させる。波が動いている間は毎フレーム新規描画になりノイズが乗ったままになる。
@@ -190,10 +203,12 @@ struct Uniforms {
   params: vec4<f32>,     // x = maxBounces, y = debugMode(0/1), z = 描画距離(maxDist), w = frameIndex
   debugColor: vec4<f32>, // rgb = 強調表示の色, aは未使用
   waterColor: vec4<f32>, // rgb = フレネル透過成分の色(水そのものの色), aは未使用
-  params2: vec4<f32>,    // x = raysPerPixel, y = roughness(matte度合い), z = 白波の閾値, w未使用
+  params2: vec4<f32>,    // x = raysPerPixel, y = roughness(matte度合い), z = 白波の閾値, w = 焼き込み空を使うか(0/1)
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var prevTex: texture_2d<f32>;
+@group(0) @binding(2) var envTex: texture_2d<f32>;  // sky-precise.htmlで焼き込んだequirectangularの空(LDR PNG)
+@group(0) @binding(3) var envSampler: sampler;
 
 const PI: f32 = 3.14159265;
 
@@ -258,6 +273,39 @@ fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
   col += vec3<f32>(0.008, 0.012, 0.025) * night;
 
   return col;
+}
+
+// 方向ベクトル(y=上)からequirectangular(緯度経度)テクスチャのUVへ変換
+// (shaders/sky-precise.htmlの焼き込みと同じ規約: u=方位角, v=天頂からの角度)。
+fn dirToEquirectUV(dir: vec3<f32>) -> vec2<f32> {
+  let phi = atan2(dir.z, dir.x);
+  let theta = acos(clamp(dir.y, -1.0, 1.0));
+  let u = phi / (2.0 * PI) + 0.5;
+  let v = theta / PI;
+  return vec2<f32>(u, v);
+}
+
+// sky-precise.htmlでエクスポートしたequirectangular PNG(Reinhardトーンマップ+ガンマ1/2.2の
+// LDR)を方向ベクトルでサンプリングし、逆変換でおおよその線形HDR放射輝度に戻す。
+// 逆変換はガンマ2.2 → Reinhardの逆 m/(1-m)。LDRで1.0近くに飽和した画素(太陽円盤など)は
+// 逆変換が発散するため上限をクランプする(0.98 -> HDRで49相当。焼き込み側の太陽強度15を
+// 十分カバーできる)。
+// 非uniformな分岐・ループの中から呼ばれるためtextureSampleは使えず、
+// textureSampleLevelでLODを明示する(README「落とし穴」参照)。
+fn envSkyColor(dir: vec3<f32>) -> vec3<f32> {
+  let uv = dirToEquirectUV(dir);
+  let ldr = textureSampleLevel(envTex, envSampler, uv, 0.0).rgb;
+  let mapped = min(pow(max(ldr, vec3<f32>(0.0)), vec3<f32>(2.2)), vec3<f32>(0.98));
+  return mapped / (vec3<f32>(1.0) - mapped);
+}
+
+// 空の放射輝度: インポートした焼き込み空(多重散乱パストレーシングの結果)があればそれを、
+// なければ従来の解析的近似(skyColor)を使う。
+fn skyRadiance(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
+  if (uniforms.params2.w > 0.5) {
+    return envSkyColor(dir);
+  }
+  return skyColor(dir, sunDir);
 }
 
 const NUM_WAVES: u32 = 8u;
@@ -495,9 +543,9 @@ fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f3
     if (hit.w < 0.5) {
       if (i == 0u) {
         // カメラのレイがそもそも水面に交差しなかった(極端に浅い角度) -> 空とみなす
-        return OceanTraceResult(skyColor(dir, sunDir), vec3<f32>(0.0, 1.0, 0.0), 0.0, 0.0, vec2<f32>(0.0, 0.0), 0.0, 0.0);
+        return OceanTraceResult(skyRadiance(dir, sunDir), vec3<f32>(0.0, 1.0, 0.0), 0.0, 0.0, vec2<f32>(0.0, 0.0), 0.0, 0.0);
       }
-      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0, firstLaplacian, firstPosXZ, firstLargeHeight, firstDist);
+      return OceanTraceResult(skyRadiance(dir, sunDir), firstNormal, 1.0, firstLaplacian, firstPosXZ, firstLargeHeight, firstDist);
     }
     let hitPos = hit.xyz;
     let wave = gerstnerSample(hitPos.xz, iTime);
@@ -520,7 +568,7 @@ fn traceOceanReflection(rayDir: vec3<f32>, rayOrigin: vec3<f32>, sunDir: vec3<f3
     ro = hitPos + n * 0.01;
 
     if (dir.y >= -0.0005) {
-      return OceanTraceResult(skyColor(dir, sunDir), firstNormal, 1.0, firstLaplacian, firstPosXZ, firstLargeHeight, firstDist);
+      return OceanTraceResult(skyRadiance(dir, sunDir), firstNormal, 1.0, firstLaplacian, firstPosXZ, firstLargeHeight, firstDist);
     }
   }
 
@@ -568,7 +616,7 @@ fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 
     var sampleColor: vec3<f32>;
     if (rayDir.y >= -0.0005) {
-      sampleColor = skyColor(rayDir, sunDir);
+      sampleColor = skyRadiance(rayDir, sunDir);
     } else {
       let result = traceOceanReflection(rayDir, eye, sunDir, iTime, maxBounces, renderDistance, roughness, &seed);
       if (result.hitWater < 0.5) {
@@ -655,6 +703,27 @@ async function main() {
   const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
   const accumFormat = 'rgba16float';
 
+  // 焼き込み空(sky-precise.htmlでエクスポートしたequirectangular PNG)のテクスチャ。
+  // インポートされるまでは1x1のプレースホルダ(useEnvSkyフラグが0の間はサンプリングされない)。
+  // copyExternalImageToTextureの宛先にはRENDER_ATTACHMENTが必要。
+  function createEnvTexture(width, height) {
+    return device.createTexture({
+      size: [width, height],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT |
+             GPUTextureUsage.COPY_DST,
+    });
+  }
+  let envTexture = createEnvTexture(1, 1);
+  let envView = envTexture.createView();
+  // 方位角方向は0..2PIで一周するのでrepeat(継ぎ目の補間のため)、天頂方向はclamp
+  const envSampler = device.createSampler({
+    magFilter: 'linear',
+    minFilter: 'linear',
+    addressModeU: 'repeat',
+    addressModeV: 'clamp-to-edge',
+  });
+
   const traceModule = device.createShaderModule({ code: traceShaderCode });
   const displayModule = device.createShaderModule({ code: displayShaderCode });
 
@@ -701,20 +770,7 @@ async function main() {
     viewA = texA.createView();
     viewB = texB.createView();
 
-    traceBindGroupSrcA = device.createBindGroup({
-      layout: tracePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: uniformBuffer } },
-        { binding: 1, resource: viewA },
-      ],
-    });
-    traceBindGroupSrcB = device.createBindGroup({
-      layout: tracePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: uniformBuffer } },
-        { binding: 1, resource: viewB },
-      ],
-    });
+    rebuildTraceBindGroups();
     displayBindGroupA = device.createBindGroup({
       layout: displayPipeline.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: viewA }],
@@ -722,6 +778,29 @@ async function main() {
     displayBindGroupB = device.createBindGroup({
       layout: displayPipeline.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: viewB }],
+    });
+  }
+
+  // 蓄積テクスチャの再生成時と、焼き込み空テクスチャのインポート(=envViewの差し替え)時の
+  // 両方から呼ばれる。
+  function rebuildTraceBindGroups() {
+    traceBindGroupSrcA = device.createBindGroup({
+      layout: tracePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 1, resource: viewA },
+        { binding: 2, resource: envView },
+        { binding: 3, resource: envSampler },
+      ],
+    });
+    traceBindGroupSrcB = device.createBindGroup({
+      layout: tracePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 1, resource: viewB },
+        { binding: 2, resource: envView },
+        { binding: 3, resource: envSampler },
+      ],
     });
   }
 
@@ -838,6 +917,41 @@ async function main() {
     frameIndex = 0;
   });
 
+  // 焼き込み空(sky-precise.htmlでエクスポートしたequirectangular PNG)のインポート。
+  // file://で開いてもCORSに引っかからないよう、fetchではなくファイル選択ダイアログ
+  // (createImageBitmap + copyExternalImageToTexture)で読み込む。
+  let useEnvSky = false;
+  const useEnvSkyInput = document.getElementById('useEnvSky');
+  const importSkyButton = document.getElementById('importSkyButton');
+  const importSkyFile = document.getElementById('importSkyFile');
+  importSkyButton.addEventListener('click', () => importSkyFile.click());
+  importSkyFile.addEventListener('change', async () => {
+    const file = importSkyFile.files[0];
+    if (!file) return;
+    const bitmap = await createImageBitmap(file);
+    if (bitmap.width !== envTexture.width || bitmap.height !== envTexture.height) {
+      envTexture.destroy();
+      envTexture = createEnvTexture(bitmap.width, bitmap.height);
+      envView = envTexture.createView();
+      rebuildTraceBindGroups();
+    }
+    device.queue.copyExternalImageToTexture(
+      { source: bitmap, flipY: false },
+      { texture: envTexture },
+      [bitmap.width, bitmap.height],
+    );
+    useEnvSky = true;
+    useEnvSkyInput.disabled = false;
+    useEnvSkyInput.checked = true;
+    document.getElementById('envSkyNote').style.display = '';
+    frameIndex = 0;
+    importSkyFile.value = '';
+  });
+  useEnvSkyInput.addEventListener('input', () => {
+    useEnvSky = useEnvSkyInput.checked;
+    frameIndex = 0;
+  });
+
   // 波のアニメーションの一時停止/再生。水面をmatteにするとノイズが乗るため、
   // デフォルトで一時停止しておき、フレームを重ねて時間積分でノイズを収束させる。
   // 再生中(波が動いている間)は毎フレーム蓄積をリセットして常に最新の1サンプルを表示する。
@@ -886,7 +1000,7 @@ async function main() {
     uniformData[16] = raysPerPixel;
     uniformData[17] = roughness;
     uniformData[18] = whitecapThreshold;
-    uniformData[19] = 0;
+    uniformData[19] = useEnvSky ? 1 : 0;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
     const srcIsA = frameIndex % 2 === 0;
