@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>海(平面鏡・焼き込み空) - WebGPU Shader Playground</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    display: block;
+    width: min(100vw, 100vh);
+    height: min(100vw, 100vh);
+  }
+  #back {
+    position: fixed;
+    top: 1rem;
+    left: 1rem;
+    z-index: 10;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.5);
+    font-family: system-ui, sans-serif;
+    font-size: 0.9rem;
+    text-decoration: none;
+    padding: 0.4rem 0.8rem;
+    border-radius: 6px;
+  }
+  #back:hover {
+    background: rgba(0, 0, 0, 0.75);
+  }
+  #panel {
+    position: fixed;
+    top: 1rem;
+    right: 1rem;
+    z-index: 10;
+    color: #eee;
+    background: rgba(0, 0, 0, 0.55);
+    font-family: system-ui, sans-serif;
+    font-size: 0.8rem;
+    padding: 0.8rem 1rem;
+    border-radius: 8px;
+    min-width: 220px;
+  }
+  #panel .row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  #panel label {
+    flex: 1;
+  }
+  #panel input[type="range"] {
+    flex: 1;
+  }
+  #panel .val {
+    width: 3.5em;
+    text-align: right;
+  }
+  #panel .row + .row {
+    margin-top: 0.5rem;
+  }
+  #panel input[type="color"] {
+    width: 2.2em;
+    height: 1.4em;
+    padding: 0;
+    border: none;
+    background: none;
+  }
+  #panel button {
+    flex: 1;
+    color: #eee;
+    background: rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 4px;
+    padding: 0.3rem 0.6rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  #panel button:hover {
+    background: rgba(255, 255, 255, 0.2);
+  }
+  #panel .status {
+    color: #9c9;
+  }
+  #panel .status.pending {
+    color: #f90;
+  }
+  #error {
+    display: none;
+    position: fixed;
+    inset: 0;
+    color: #fff;
+    background: #111;
+    font-family: system-ui, sans-serif;
+    padding: 2rem;
+    box-sizing: border-box;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<a id="back" href="../index.html">&larr; 一覧に戻る</a>
+<div id="panel">
+  <div class="row">
+    <button id="importSkyButton" type="button">空(PNG)をインポート</button>
+  </div>
+  <div class="row">
+    <span class="status pending" id="skyStatus">未インポート</span>
+  </div>
+  <div class="row">
+    <label for="sunHour">太陽の時刻(インポート画像の焼き込み時刻に合わせる)</label>
+  </div>
+  <div class="row">
+    <input id="sunHour" type="range" min="0" max="24" step="0.1" value="10">
+    <span class="val" id="sunHourVal">10:00</span>
+  </div>
+  <div class="row">
+    <label for="waterColor">水の色(透過)</label>
+    <input id="waterColor" type="color" value="#04174d">
+  </div>
+</div>
+<input id="importSkyFile" type="file" accept="image/png" style="display:none">
+<canvas id="gpuCanvas"></canvas>
+<div id="error"></div>
+
+<script>
+// フルスクリーン三角形の頂点シェーダー(全モジュール共通)
+const vertexShaderCode = /* wgsl */ `
+@vertex
+fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0)
+  );
+  return vec4<f32>(pos[vertexIndex], 0.0, 1.0);
+}
+`;
+
+// 海面を波のない完全な平面(y=0)として扱い、shaders/sky-precise.htmlで焼き込んだ
+// equirectangular PNGを空として反射させるだけの、最も単純な海。
+// ガーストナー波(shaders/ocean-gerstner.html)のような高さフィールドの探索・粗さによる
+// 散乱・白波・グリッターは持たない。無限に平らな鏡面なので反射方向は視線方向だけで決まり
+// (法線が(0,1,0)で一定なため、水面上のどの位置で反射しても結果は同じ)、交差点の座標自体は
+// 計算に使わない。そのため蓄積(時間積分)も不要で、フレームごとに再計算するだけの
+// リアルタイム描画になっている。太陽の輝きも乱数によるグリッターではなく、焼き込み画像に
+// 元々含まれる太陽円盤がそのまま鏡面反射で映り込む形で表現される。
+const traceShaderCode = /* wgsl */ `
+${vertexShaderCode}
+
+struct Uniforms {
+  resAndSun: vec4<f32>,  // xy = resolution, z = sunHour(太陽の時刻), w未使用
+  waterColor: vec4<f32>, // rgb = フレネル透過成分の色(水そのものの色), aは未使用
+};
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(1) var envTex: texture_2d<f32>;
+@group(0) @binding(2) var envSampler: sampler;
+
+const PI: f32 = 3.14159265;
+
+// 太陽がどれだけ地平線の上にあるか(0=夜, 1=昼)。透過色の明るさに使う。
+fn sunVisibilityOf(sunDir: vec3<f32>) -> f32 {
+  return smoothstep(-0.12, 0.06, sunDir.y);
+}
+
+// shaders/sky-precise.htmlの太陽軌道式と同じもの(インポートした空の太陽位置と、
+// この式で計算するsunDirを一致させるため複製している)。
+fn hourToSunDir(hour: f32) -> vec3<f32> {
+  let sunAngle = (hour - 6.0) / 12.0 * PI;
+  return normalize(vec3<f32>(cos(sunAngle) * 0.35, sin(sunAngle), -0.9));
+}
+
+// 方向ベクトル(y=上)からequirectangular(緯度経度)テクスチャのUVへ変換。
+// shaders/sky-precise.htmlの焼き込みと同じ規約。
+fn dirToEquirectUV(dir: vec3<f32>) -> vec2<f32> {
+  let phi = atan2(dir.z, dir.x);
+  let theta = acos(clamp(dir.y, -1.0, 1.0));
+  let u = phi / (2.0 * PI) + 0.5;
+  let v = theta / PI;
+  return vec2<f32>(u, v);
+}
+
+// sky-precise.htmlがエクスポートするPNGは既にReinhardトーンマップ+ガンマ補正済みの
+// 表示用LDR画像であり、sky-precise.html自身の表示パスもこれをそのままサンプリングして
+// 出力している。この海のシェーダーもHDRへの逆変換はせず、同じ表示空間のまま
+// フレネルで水の色と混ぜて出力する(HDR蓄積バッファを持たないので、逆変換して
+// 得たとしてもトーンマップし直す先が無い)。
+// 非uniformな分岐の中から呼ぶため、textureSampleではなくtextureSampleLevelでLODを明示する
+// (README「落とし穴」参照: 非uniform制御フロー内でtextureSampleは呼べない)。
+fn sampleSky(dir: vec3<f32>) -> vec3<f32> {
+  let uv = dirToEquirectUV(dir);
+  return textureSampleLevel(envTex, envSampler, uv, 0.0).rgb;
+}
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let res = uniforms.resAndSun.xy;
+  let sunHour = uniforms.resAndSun.z;
+  let sunDir = hourToSunDir(sunHour);
+  let transmissionColor = uniforms.waterColor.rgb * sunVisibilityOf(sunDir);
+
+  // 固定カメラ(水平方向を向く。shaders/ocean-gerstner.htmlと同じ配置)
+  let eye = vec3<f32>(0.0, 2.5, 0.0);
+  let forward = vec3<f32>(0.0, 0.0, -1.0);
+  let worldUp = vec3<f32>(0.0, 1.0, 0.0);
+  let right = normalize(cross(forward, worldUp));
+  let up = cross(right, forward);
+  let fov = 1.5;
+
+  // 水平線のジャギーを抑えるための2x2グリッドのサブピクセルオフセット(乱数なし、固定パターン)
+  var offsets = array<vec2<f32>, 4>(
+    vec2<f32>(-0.25, -0.25), vec2<f32>(0.25, -0.25),
+    vec2<f32>(-0.25,  0.25), vec2<f32>(0.25,  0.25),
+  );
+
+  var colorSum = vec3<f32>(0.0, 0.0, 0.0);
+  for (var i = 0u; i < 4u; i = i + 1u) {
+    let ndc = ((fragCoord.xy + offsets[i]) - 0.5 * res) / res.y;
+    let rayDir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
+
+    var sampleColor: vec3<f32>;
+    if (rayDir.y >= -0.0005) {
+      // 水平線より上 = 空を直接見ている
+      sampleColor = sampleSky(rayDir);
+    } else {
+      // 無限に平らな鏡面(法線は常に(0,1,0))なので、反射方向はy成分の符号を
+      // 反転するだけで求まり、反射点の位置は結果に影響しない
+      let reflDir = vec3<f32>(rayDir.x, -rayDir.y, rayDir.z);
+      let sky = sampleSky(reflDir);
+
+      // Fresnel(Schlick近似): dot(視線, 法線) = dot(-rayDir, (0,1,0)) = -rayDir.y
+      let cosTheta = max(-rayDir.y, 0.0);
+      let f0 = 0.02; // 空気->水の垂直入射反射率(屈折率1.33相当)
+      let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+
+      sampleColor = mix(transmissionColor, sky, fresnel);
+    }
+    colorSum += sampleColor;
+  }
+
+  return vec4<f32>(colorSum / 4.0, 1.0);
+}
+`;
+
+async function main() {
+  const canvas = document.getElementById('gpuCanvas');
+
+  if (!navigator.gpu) {
+    showError('このブラウザはWebGPUに対応していません。\nChrome/Edge の最新版などでお試しください。');
+    return;
+  }
+
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    showError('WebGPUアダプタの取得に失敗しました。');
+    return;
+  }
+  const device = await adapter.requestDevice();
+  device.lost.then((info) => console.log('WebGPU device lost:', info.reason, info.message));
+
+  const context = canvas.getContext('webgpu');
+  const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+
+  const traceModule = device.createShaderModule({ code: traceShaderCode });
+  const tracePipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: traceModule, entryPoint: 'vs_main' },
+    fragment: { module: traceModule, entryPoint: 'fs_main', targets: [{ format: canvasFormat }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  const uniformBuffer = device.createBuffer({
+    size: 32,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  // インポート待ちの間に表示するプレースホルダ(1x1、控えめな青)。
+  // インポートすると実サイズのテクスチャを作り直す。
+  function createEnvTexture(width, height) {
+    return device.createTexture({
+      size: [width, height],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT |
+             GPUTextureUsage.COPY_DST,
+    });
+  }
+  let envTexture = createEnvTexture(1, 1);
+  device.queue.writeTexture(
+    { texture: envTexture },
+    new Uint8Array([20, 30, 45, 255]),
+    { bytesPerRow: 4 },
+    { width: 1, height: 1 },
+  );
+  let envView = envTexture.createView();
+  // 方位角方向は0..2PIで一周するのでrepeat(継ぎ目の補間のため)、天頂方向はclamp
+  const envSampler = device.createSampler({
+    magFilter: 'linear',
+    minFilter: 'linear',
+    addressModeU: 'repeat',
+    addressModeV: 'clamp-to-edge',
+  });
+
+  let traceBindGroup = null;
+  function rebuildBindGroup() {
+    traceBindGroup = device.createBindGroup({
+      layout: tracePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 1, resource: envView },
+        { binding: 2, resource: envSampler },
+      ],
+    });
+  }
+  rebuildBindGroup();
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const size = Math.max(1, Math.floor(Math.min(window.innerWidth, window.innerHeight) * dpr));
+    canvas.width = size;
+    canvas.height = size;
+    context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // UI: 太陽の時刻(インポート画像との整合用) / 水の色
+  let sunHour = 10.0;
+  let waterColor = [0, 0, 0];
+
+  const sunHourInput = document.getElementById('sunHour');
+  const sunHourVal = document.getElementById('sunHourVal');
+  function formatHour(h) {
+    const hh = Math.floor(h);
+    const mm = Math.round((h - hh) * 60);
+    return String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+  }
+  sunHourInput.addEventListener('input', () => {
+    sunHour = parseFloat(sunHourInput.value);
+    sunHourVal.textContent = formatHour(sunHour);
+  });
+
+  function hexToRgb(hex) {
+    const v = parseInt(hex.slice(1), 16);
+    return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255];
+  }
+
+  const waterColorInput = document.getElementById('waterColor');
+  waterColor = hexToRgb(waterColorInput.value);
+  waterColorInput.addEventListener('input', () => {
+    waterColor = hexToRgb(waterColorInput.value);
+  });
+
+  // 空のPNGインポート。file://で開いてもCORSに引っかからないよう、fetchではなく
+  // ファイル選択ダイアログ(createImageBitmap + copyExternalImageToTexture)で読み込む。
+  const skyStatus = document.getElementById('skyStatus');
+  const importSkyButton = document.getElementById('importSkyButton');
+  const importSkyFile = document.getElementById('importSkyFile');
+  importSkyButton.addEventListener('click', () => importSkyFile.click());
+  importSkyFile.addEventListener('change', async () => {
+    const file = importSkyFile.files[0];
+    if (!file) return;
+    const bitmap = await createImageBitmap(file);
+    envTexture.destroy();
+    envTexture = createEnvTexture(bitmap.width, bitmap.height);
+    envView = envTexture.createView();
+    rebuildBindGroup();
+    device.queue.copyExternalImageToTexture(
+      { source: bitmap, flipY: false },
+      { texture: envTexture },
+      [bitmap.width, bitmap.height],
+    );
+    skyStatus.textContent = 'インポート済み (' + bitmap.width + 'x' + bitmap.height + ')';
+    skyStatus.classList.remove('pending');
+    importSkyFile.value = '';
+  });
+
+  const uniformData = new Float32Array(8);
+
+  function frame() {
+    uniformData[0] = canvas.width;
+    uniformData[1] = canvas.height;
+    uniformData[2] = sunHour;
+    uniformData[3] = 0;
+    uniformData[4] = waterColor[0];
+    uniformData[5] = waterColor[1];
+    uniformData[6] = waterColor[2];
+    uniformData[7] = 0;
+    device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    pass.setPipeline(tracePipeline);
+    pass.setBindGroup(0, traceBindGroup);
+    pass.draw(3);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+function showError(message) {
+  const el = document.getElementById('error');
+  el.textContent = message;
+  el.style.display = 'block';
+}
+
+main().catch((err) => {
+  console.error(err);
+  showError('エラーが発生しました:\n' + err.message);
+});
+</script>
+</body>
+</html>

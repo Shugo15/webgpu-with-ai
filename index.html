@@ -95,6 +95,12 @@
       </a>
     </li>
     <li>
+      <a href="shaders/ocean-mirror.html">
+        <span class="name">海(平面鏡・焼き込み空)</span>
+        <span class="desc">波のない完全に平らな水面で、空(sky-precise.htmlで焼き込んだequirectangular PNGをインポート)をそのまま鏡面反射させるだけの最小構成の海。フレネルで水の透過色とブレンドする</span>
+      </a>
+    </li>
+    <li>
       <a href="shaders/sky-precise.html">
         <span class="name">空(高精度・多重散乱パストレーシング)</span>
         <span class="desc">大気をレイリー散乱・ミー散乱・オゾン吸収の球殻状の層としてモンテカルロ・パストレーシングし、多重散乱まで含めて物理的に計算する低速だが正確な空。equirectangular(緯度経度)テクスチャに焼き込み、フレームを重ねて時間積分で収束させる。PNGエクスポート/インポートにも対応し、海の反射用の環境マップとして使う予定</span>
