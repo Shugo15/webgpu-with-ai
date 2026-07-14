@@ -56,6 +56,14 @@
   #panel input[type="range"] {
     flex: 1;
   }
+  #panel select {
+    background: #23232e;
+    border: 1px solid #3a3a48;
+    color: #eee;
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+  }
   #panel button {
     background: #23232e;
     border: 1px solid #3a3a48;
@@ -104,6 +112,15 @@
     <label for="maxBounces">最大散乱回数</label>
     <input id="maxBounces" type="range" min="1" max="8" step="1" value="4">
     <span class="val" id="maxBouncesVal">4</span>
+  </div>
+  <div class="row">
+    <label for="debugMode">表示モード</label>
+    <select id="debugMode">
+      <option value="0">通常</option>
+      <option value="1">輝度ヒートマップ</option>
+      <option value="2">散乱角ヒートマップ(太陽からの角度)</option>
+      <option value="3">HG位相関数の分母(denom)ヒートマップ</option>
+    </select>
   </div>
   <div class="row">
     <button id="bakeBtn">リセットして焼き込み開始</button>
@@ -489,12 +506,27 @@ fn fs_resolve(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32>
 const displayShaderCode = commonShaderCode + vertexShaderCode + /* wgsl */ `
 struct DisplayUniforms {
   iResolution: vec2<f32>,
-  _pad0: f32,
-  _pad1: f32,
+  sunHour: f32,
+  debugMode: f32, // 0=通常 1=輝度ヒートマップ 2=散乱角ヒートマップ 3=HG位相関数分母(denom)ヒートマップ
 };
 @group(0) @binding(0) var<uniform> displayUniforms: DisplayUniforms;
 @group(0) @binding(1) var equirectTex: texture_2d<f32>;
 @group(0) @binding(2) var equirectSampler: sampler;
+
+// 黒->青->緑->黄->赤の簡易サーモカラー(0..1を疑似カラーに変換、デバッグ表示用)
+fn heatColor(t: f32) -> vec3<f32> {
+  var stops = array<vec3<f32>, 5>(
+    vec3<f32>(0.0, 0.0, 0.0),
+    vec3<f32>(0.0, 0.0, 1.0),
+    vec3<f32>(0.0, 1.0, 0.0),
+    vec3<f32>(1.0, 1.0, 0.0),
+    vec3<f32>(1.0, 0.0, 0.0),
+  );
+  let x = clamp(t, 0.0, 1.0) * 4.0;
+  let i = min(u32(x), 3u);
+  let frac = x - f32(i);
+  return mix(stops[i], stops[i + 1u], frac);
+}
 
 @fragment
 fn fs_display(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
@@ -507,6 +539,30 @@ fn fs_display(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32>
   let up = cross(right, forward);
   let fov = 1.5;
   let dir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
+
+  let mode = i32(displayUniforms.debugMode);
+  if (mode == 1) {
+    let uv = dirToEquirectUV(dir);
+    let col = textureSampleLevel(equirectTex, equirectSampler, uv, 0.0).rgb;
+    let lum = (col.r + col.g + col.b) / 3.0;
+    return vec4<f32>(heatColor(lum), 1.0);
+  }
+  if (mode == 2 || mode == 3) {
+    let sunDir = hourToSunDir(displayUniforms.sunHour);
+    let cosAngle = clamp(dot(dir, sunDir), -1.0, 1.0);
+    if (mode == 2) {
+      // 散乱角(太陽方向との角度)0°(赤)〜180°(黒)
+      let angle = acos(cosAngle);
+      return vec4<f32>(heatColor(1.0 - angle / PI), 1.0);
+    }
+    // HG位相関数の分母 1+g^2-2g*cosTheta を [(1-g)^2, (1+g)^2] で正規化して疑似カラー化
+    let g = MIE_G;
+    let denom = 1.0 + g * g - 2.0 * g * cosAngle;
+    let denomMin = (1.0 - g) * (1.0 - g);
+    let denomMax = (1.0 + g) * (1.0 + g);
+    let t = (denom - denomMin) / (denomMax - denomMin);
+    return vec4<f32>(heatColor(1.0 - t), 1.0);
+  }
 
   let uv = dirToEquirectUV(dir);
   let sampled = textureSampleLevel(equirectTex, equirectSampler, uv, 0.0).rgb;
@@ -647,6 +703,7 @@ async function main() {
   let maxBounces = 4;
   let frameIndex = 0;
   let liveMode = true; // false: PNGインポート直後で表示が固定されている状態
+  let debugMode = 0; // 0=通常 1=輝度ヒートマップ 2=散乱角ヒートマップ 3=denomヒートマップ
 
   function formatHour(h) {
     const hh = Math.floor(h);
@@ -670,6 +727,10 @@ async function main() {
   maxBouncesInput.addEventListener('input', () => {
     maxBounces = parseInt(maxBouncesInput.value, 10);
     maxBouncesVal.textContent = String(maxBounces);
+  });
+
+  document.getElementById('debugMode').addEventListener('change', (e) => {
+    debugMode = parseInt(e.target.value, 10);
   });
 
   document.getElementById('bakeBtn').addEventListener('click', () => {
@@ -786,7 +847,7 @@ async function main() {
       setStatus('蓄積中... サンプル数 ' + frameIndex + ' (太陽の時刻 ' + formatHour(sunHour) + ')');
     }
 
-    const displayData = new Float32Array([canvas.width, canvas.height, 0, 0]);
+    const displayData = new Float32Array([canvas.width, canvas.height, sunHour, debugMode]);
     device.queue.writeBuffer(displayUniformBuffer, 0, displayData);
 
     const displayPass = encoder.beginRenderPass({
