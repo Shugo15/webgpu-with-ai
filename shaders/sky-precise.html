@@ -156,8 +156,14 @@
 <div id="error"></div>
 
 <script>
-const EQUIRECT_W = 1024;
-const EQUIRECT_H = 512;
+// 太陽の見かけの直径(角半径0.02ラジアン)がテクセル換算で何テクセルになるかが、
+// 焼き込んだ空を反射で参照する側(shaders/ocean-mirror.htmlなど)でbilinear補間により
+// 円盤がどれだけ痩せて見えるかを左右する。1024x512では直径が横に約6.5テクセルしかなく、
+// 反射方向がテクセル境界の近くにずれるだけで大きく減衰してしまっていた。2048x1024に
+// 上げることで直径を約13テクセルに広げ、bilinear補間に対する耐性を上げている
+// (代わりに焼き込みの計算コスト・メモリはテクセル数に比例して約4倍になる)。
+const EQUIRECT_W = 2048;
+const EQUIRECT_H = 1024;
 
 const commonShaderCode = /* wgsl */ `
 const PI: f32 = 3.14159265;
