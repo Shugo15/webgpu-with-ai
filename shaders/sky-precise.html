@@ -242,14 +242,17 @@ fn computeSunTransmittance(pos: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
   }
   let topT = raySphereIntersect(pos, sunDir, ATMOSPHERE_RADIUS);
   let dist = max(topT.y, 0.0);
-  let steps = 8u;
-  let stepSize = dist / f32(steps);
+  // 主レイと同じ理由(水平線に近い太陽ほど距離が桁違いに伸びる)でu^2の非均等刻みにする
+  let steps = 12u;
   var opticalDepth = vec3<f32>(0.0);
-  var t = stepSize * 0.5;
   for (var i = 0u; i < steps; i = i + 1u) {
-    let samplePos = pos + sunDir * t;
-    opticalDepth += extinctionAt(samplePos) * stepSize;
-    t += stepSize;
+    let u0 = f32(i) / f32(steps);
+    let u1 = f32(i + 1u) / f32(steps);
+    let tStart = dist * u0 * u0;
+    let tEnd = dist * u1 * u1;
+    let stepLen = tEnd - tStart;
+    let samplePos = pos + sunDir * (tStart + stepLen * 0.5);
+    opticalDepth += extinctionAt(samplePos) * stepLen;
   }
   return exp(-opticalDepth);
 }
@@ -325,24 +328,30 @@ fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn:
       hitsGround = false;
     }
 
-    let numSteps = 16u;
-    let stepSize = segEnd / f32(numSteps);
+    // 水平線に近い(=仰角が小さい)視線ほどsegEndが桁違いに長くなる(真上: 数十km,
+    // 水平: 数百km)。均等刻みだと水平線付近でステップ幅が大気の密度変化のスケール
+    // (レイリー8km, ミー1.2km)を大きく超えてしまい、積分が破綻する。
+    // u(0..1)をu^2で再パラメータ化してカメラに近い側を密に、遠い側を粗く刻む。
+    let numSteps = 24u;
     var collided = false;
     var collidePos = pos + rayDir * segEnd;
-    var stepStart = 0.0;
 
     for (var i = 0u; i < numSteps; i = i + 1u) {
-      let midPos = pos + rayDir * (stepStart + stepSize * 0.5);
+      let u0 = f32(i) / f32(numSteps);
+      let u1 = f32(i + 1u) / f32(numSteps);
+      let tStart = segEnd * u0 * u0;
+      let tEnd = segEnd * u1 * u1;
+      let stepLen = tEnd - tStart;
+      let midPos = pos + rayDir * (tStart + stepLen * 0.5);
       let extLum = max(luminance(extinctionAt(midPos)), 1e-8);
-      let collideProb = 1.0 - exp(-extLum * stepSize);
+      let collideProb = 1.0 - exp(-extLum * stepLen);
       if (rand(&seed) < collideProb) {
         let u = rand(&seed);
         let subT = -log(1.0 - u * collideProb) / extLum;
-        collidePos = pos + rayDir * (stepStart + subT);
+        collidePos = pos + rayDir * (tStart + subT);
         collided = true;
         break;
       }
-      stepStart += stepSize;
     }
 
     if (!collided) {
