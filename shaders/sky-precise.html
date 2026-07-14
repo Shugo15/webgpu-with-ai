@@ -177,7 +177,9 @@ const MIE_G: f32 = 0.8;
 const OZONE_ABSORPTION = vec3<f32>(0.650e-6, 1.881e-6, 0.085e-6);
 const OZONE_CENTER_ALTITUDE: f32 = 25000.0;
 const OZONE_WIDTH: f32 = 15000.0;
-const SUN_INTENSITY: f32 = 15.0;
+const SUN_INTENSITY: f32 = 15.0; // 太陽の照度(irradiance)。NEEの散乱寄与はこの値をそのまま使う
+const SUN_ANGULAR_RADIUS_OUTER: f32 = 0.02;  // 太陽円盤の見かけの半径(ラジアン、外側のぼかし境界)
+const SUN_ANGULAR_RADIUS_INNER: f32 = 0.009; // 太陽円盤の見かけの半径(ラジアン、内側のくっきり境界)
 
 fn rayleighPhase(cosTheta: f32) -> f32 {
   return 3.0 / (16.0 * PI) * (1.0 + cosTheta * cosTheta);
@@ -347,6 +349,15 @@ fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn:
   var throughput = vec3<f32>(1.0, 1.0, 1.0);
   var radiance = vec3<f32>(0.0, 0.0, 0.0);
 
+  // 太陽そのものを直接見た場合の輝度(radiance)。NEEのSUN_INTENSITYは「太陽から降り注ぐ
+  // 照度(irradiance, E)」であり、太陽の見かけの立体角Ω(非常に小さい)に照度を集約した
+  // ものが輝度L=E/Ωになる。この変換をせずSUN_INTENSITYをそのまま円盤の色に使うと、
+  // 空の散乱光と同じオーダーの明るさにしかならず、実際の太陽(空よりも桁違いに明るい)
+  // の明るさを表現できていなかった(Reinhardトーンマップでどちらも白飽和するため
+  // 見た目では気づきにくかった)。
+  let sunSolidAngle = 2.0 * PI * (1.0 - cos(SUN_ANGULAR_RADIUS_OUTER));
+  let sunDiscRadiance = SUN_INTENSITY / sunSolidAngle;
+
   for (var bounce = 0u; bounce < maxBounces; bounce = bounce + 1u) {
     let groundT = raySphereIntersect(pos, rayDir, PLANET_RADIUS);
     let topT = raySphereIntersect(pos, rayDir, ATMOSPHERE_RADIUS);
@@ -358,6 +369,24 @@ fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn:
     } else {
       segEnd = max(topT.y, 0.0);
       hitsGround = false;
+    }
+
+    // 太陽本体を直接見ている場合の寄与(カメラの主レイ、bounce==0のみ。散乱後に偶然
+    // 太陽方向へ抜けた場合の寄与はNEEと二重カウントになるため加算しない)。
+    // 太陽は見かけの立体角が非常に小さいため、下の自由行程サンプリングが偶然
+    // 「衝突しなかった」ときだけ加算する形にすると(旧実装)、境界付近のテクセル/
+    // ピクセルで0とsunDiscRadiance(輝度に直すと更に大きい)を行き来する強いノイズに
+    // なってしまう。そこでNEEと同じ考え方で、衝突判定の結果に関係なく毎回、視線方向の
+    // 透過率を決定的な数値積分(computeSunTransmittance、内部でraySphereIntersectにより
+    // 地面に遮られていれば自動的に0を返す)で計算して加算する。これによりノイズの
+    // 発生源だった確率的な二値判定を、この項の計算から完全に切り離している。
+    if (bounce == 0u) {
+      let cosSun = dot(rayDir, sunDir);
+      let discMask = smoothstep(cos(SUN_ANGULAR_RADIUS_OUTER), cos(SUN_ANGULAR_RADIUS_INNER), cosSun);
+      if (discMask > 0.0) {
+        let viewTransmittance = computeSunTransmittance(pos, rayDir, max(raymarchSteps / 2u, 4u), stepPower);
+        radiance += throughput * vec3<f32>(1.0, 0.98, 0.92) * discMask * sunDiscRadiance * viewTransmittance;
+      }
     }
 
     // 水平線に近い(=仰角が小さい)視線ほどsegEndが桁違いに長くなる(真上: 数十km,
@@ -391,17 +420,6 @@ fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn:
       if (hitsGround) {
         radiance += throughput * vec3<f32>(0.02, 0.02, 0.025);
       } else {
-        // 太陽円盤そのものは、まだ一度も散乱していないカメラの主レイ(bounce==0)でだけ加算する。
-        // 散乱後(bounce>0)は、各衝突点で既にNext Event Estimationにより太陽への直接寄与を
-        // 明示的に加算済みなので、そこでランダムに選んだ続きの方向がたまたま太陽の位置と
-        // 一致した場合にも同じ寄与を二重に数えてしまうと、稀にしか起きない代わりに大きな値を
-        // 持つ「ホタル」ノイズの主因になる(サンプル数を増やすほど新しいホタルが出現する頻度が
-        // 増え、むしろノイズが目立って見える)。
-        if (bounce == 0u) {
-          let cosSun = dot(rayDir, sunDir);
-          let sunDisc = smoothstep(cos(0.02), cos(0.009), cosSun);
-          radiance += throughput * vec3<f32>(1.0, 0.98, 0.92) * sunDisc * SUN_INTENSITY;
-        }
         let isNight = smoothstep(0.05, -0.15, sunDir.y);
         let starField = step(0.997, hash21(floor(rayDir.xz * 400.0))) * hash21(rayDir.xy * 123.4);
         radiance += throughput * vec3<f32>(starField) * isNight * 0.5;
