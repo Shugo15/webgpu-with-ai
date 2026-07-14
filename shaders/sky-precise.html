@@ -123,6 +123,12 @@
     </select>
   </div>
   <div class="row">
+    <label for="directMode">
+      <input id="directMode" type="checkbox" style="width:auto; margin-right:0.4rem;">
+      equirectテクスチャを介さず画面解像度で直接計算(検証用)
+    </label>
+  </div>
+  <div class="row">
     <button id="bakeBtn">リセットして焼き込み開始</button>
     <button id="exportBtn">PNGとしてエクスポート</button>
     <button id="importBtn">PNGをインポート</button>
@@ -485,6 +491,45 @@ fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 }
 `;
 
+// 直接計算パス: equirectangularテクスチャに焼き込んでからサンプリングするのではなく、
+// 画面の各ピクセルについてカメラのレイ方向を直接求めてパストレーシングする(低解像度な
+// テクスチャの補間による見え方の違いなのか、それとも本物の現象なのかを見比べるための検証用)。
+const directTraceShaderCode = commonShaderCode + vertexShaderCode + /* wgsl */ `
+struct DirectTraceUniforms {
+  resAndSun: vec4<f32>, // xy=解像度, z=太陽の時刻, w=フレーム数
+  params: vec4<f32>,    // x=最大散乱回数
+};
+@group(0) @binding(0) var<uniform> directUniforms: DirectTraceUniforms;
+@group(0) @binding(1) var prevDirectTex: texture_2d<f32>;
+
+@fragment
+fn fs_directTrace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let res = directUniforms.resAndSun.xy;
+  let ndc = (fragCoord.xy - 0.5 * res) / res.y;
+
+  let forward = normalize(vec3<f32>(0.0, 0.35, -1.0));
+  let worldUp = vec3<f32>(0.0, 1.0, 0.0);
+  let right = normalize(cross(forward, worldUp));
+  let up = cross(right, forward);
+  let fov = 1.5;
+  let dir = normalize(forward + right * ndc.x * fov - up * ndc.y * fov);
+
+  let sunDir = hourToSunDir(directUniforms.resAndSun.z);
+  let frameIndex = directUniforms.resAndSun.w;
+  let maxBounces = u32(directUniforms.params.x);
+
+  let pixelIndex = u32(fragCoord.x) + u32(fragCoord.y) * u32(res.x);
+  let seed = pixelIndex * 9781u + u32(frameIndex) * 6271u + 1u;
+
+  let sampleColor = traceSkyPrecise(dir, sunDir, maxBounces, seed);
+
+  let prev = textureLoad(prevDirectTex, vec2<i32>(i32(fragCoord.x), i32(fragCoord.y)), 0).rgb;
+  let n = frameIndex + 1.0;
+  let newAvg = prev + (sampleColor - prev) / n;
+  return vec4<f32>(newAvg, 1.0);
+}
+`;
+
 // 解決パス: HDRの蓄積テクスチャをトーンマップ+ガンマ補正してLDR(rgba8unorm)に変換する。
 // このLDRテクスチャが表示用サンプリング・PNGエクスポート・PNGインポートの共通の場になる。
 const resolveShaderCode = vertexShaderCode + /* wgsl */ `
@@ -699,11 +744,82 @@ async function main() {
   }
   let displayBindGroup = makeDisplayBindGroup();
 
+  // --- 直接計算(検証用)パイプライン: equirectテクスチャを介さず、画面解像度のまま
+  // カメラのレイ方向で直接パストレーシングする。低解像度テクスチャの補間による
+  // 見え方の違いなのか、本物の現象なのかを見比べるためのもの。 ---
+  const directTraceModule = device.createShaderModule({ code: directTraceShaderCode });
+  const directTracePipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: directTraceModule, entryPoint: 'vs_main' },
+    fragment: { module: directTraceModule, entryPoint: 'fs_directTrace', targets: [{ format: accumFormat }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const directTraceUniformBuffer = device.createBuffer({
+    size: 32,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  // 解決(トーンマップ)は既存のresolveModuleを再利用しつつ、出力先だけcanvasのフォーマットにする
+  const directResolvePipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: resolveModule, entryPoint: 'vs_main' },
+    fragment: { module: resolveModule, entryPoint: 'fs_resolve', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  let directAccumTexA = null, directAccumTexB = null;
+  let directAccumViewA = null, directAccumViewB = null;
+  let directTraceBindGroupSrcA = null, directTraceBindGroupSrcB = null;
+  let directResolveBindGroupFromA = null, directResolveBindGroupFromB = null;
+  let directFrameIndex = 0;
+
+  function createDirectAccumTextures(width, height) {
+    if (directAccumTexA) directAccumTexA.destroy();
+    if (directAccumTexB) directAccumTexB.destroy();
+    directAccumTexA = device.createTexture({
+      size: [width, height],
+      format: accumFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    directAccumTexB = device.createTexture({
+      size: [width, height],
+      format: accumFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    directAccumViewA = directAccumTexA.createView();
+    directAccumViewB = directAccumTexB.createView();
+    directTraceBindGroupSrcA = device.createBindGroup({
+      layout: directTracePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: directTraceUniformBuffer } },
+        { binding: 1, resource: directAccumViewA },
+      ],
+    });
+    directTraceBindGroupSrcB = device.createBindGroup({
+      layout: directTracePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: directTraceUniformBuffer } },
+        { binding: 1, resource: directAccumViewB },
+      ],
+    });
+    directResolveBindGroupFromA = device.createBindGroup({
+      layout: directResolvePipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: directAccumViewA }],
+    });
+    directResolveBindGroupFromB = device.createBindGroup({
+      layout: directResolvePipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: directAccumViewB }],
+    });
+    directFrameIndex = 0;
+  }
+  createDirectAccumTextures(canvas.width, canvas.height);
+  window.addEventListener('resize', () => createDirectAccumTextures(canvas.width, canvas.height));
+
   let sunHour = 10.0;
   let maxBounces = 4;
   let frameIndex = 0;
   let liveMode = true; // false: PNGインポート直後で表示が固定されている状態
   let debugMode = 0; // 0=通常 1=輝度ヒートマップ 2=散乱角ヒートマップ 3=denomヒートマップ
+  let directMode = false; // true: equirectテクスチャを介さず画面解像度で直接計算
 
   function formatHour(h) {
     const hh = Math.floor(h);
@@ -733,8 +849,14 @@ async function main() {
     debugMode = parseInt(e.target.value, 10);
   });
 
+  document.getElementById('directMode').addEventListener('change', (e) => {
+    directMode = e.target.checked;
+    directFrameIndex = 0;
+  });
+
   document.getElementById('bakeBtn').addEventListener('click', () => {
     frameIndex = 0;
+    directFrameIndex = 0;
     liveMode = true;
     setStatus('太陽の時刻 ' + formatHour(sunHour) + ' で焼き込みを開始しました');
   });
@@ -807,6 +929,50 @@ async function main() {
 
   function frame() {
     const encoder = device.createCommandEncoder();
+
+    if (directMode) {
+      // equirectテクスチャを介さず、画面解像度のまま直接パストレーシングして蓄積する
+      const directData = new Float32Array([canvas.width, canvas.height, sunHour, directFrameIndex, maxBounces, 0, 0, 0]);
+      device.queue.writeBuffer(directTraceUniformBuffer, 0, directData);
+
+      const srcIsA = directFrameIndex % 2 === 0;
+      const directTraceBindGroup = srcIsA ? directTraceBindGroupSrcA : directTraceBindGroupSrcB;
+      const directDstView = srcIsA ? directAccumViewB : directAccumViewA;
+      const directResolveBindGroup = srcIsA ? directResolveBindGroupFromB : directResolveBindGroupFromA;
+
+      const directTracePass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: directDstView,
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      directTracePass.setPipeline(directTracePipeline);
+      directTracePass.setBindGroup(0, directTraceBindGroup);
+      directTracePass.draw(3);
+      directTracePass.end();
+
+      const directResolvePass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: context.getCurrentTexture().createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      directResolvePass.setPipeline(directResolvePipeline);
+      directResolvePass.setBindGroup(0, directResolveBindGroup);
+      directResolvePass.draw(3);
+      directResolvePass.end();
+
+      directFrameIndex += 1;
+      setStatus('直接計算で蓄積中... サンプル数 ' + directFrameIndex + ' (太陽の時刻 ' + formatHour(sunHour) + ')');
+
+      device.queue.submit([encoder.finish()]);
+      requestAnimationFrame(frame);
+      return;
+    }
 
     if (liveMode) {
       const traceData = new Float32Array([sunHour, frameIndex, maxBounces, 0]);
