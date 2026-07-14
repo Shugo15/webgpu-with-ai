@@ -150,18 +150,19 @@
     オゾン吸収、それぞれ高度によって密度が指数関数的/釣鐘状に変化)としてモンテカルロ・パストレーシングし、
     多重散乱まで含めて物理的に計算する。1フレームにつき1サンプルを蓄積し、フレームを重ねるほどノイズが収束する
     (これまでのCornell Box/海のシェーダーと同じ時間積分デノイズ)。収束の途中でもいつでもPNGエクスポート/インポート
-    が可能。太陽の時刻を変えると蓄積はリセットされる。
+    が可能。太陽の時刻を変えると蓄積はリセットされる。太陽の円盤はテクスチャに焼き込まず、表示時に時刻から
+    解析的に描画する(そのためエクスポートしたPNGには太陽円盤が含まれない)。焼き込み時刻はPNGのメタデータ
+    (tEXtチャンク)として埋め込まれ、インポート時にスライダーへ自動で復元される。
   </p>
 </div>
 <div id="error"></div>
 
 <script>
-// 太陽の見かけの直径(角半径0.02ラジアン)がテクセル換算で何テクセルになるかが、
-// 焼き込んだ空を反射で参照する側(shaders/ocean-mirror.htmlなど)でbilinear補間により
-// 円盤がどれだけ痩せて見えるかを左右する。1024x512では直径が横に約6.5テクセルしかなく、
-// 反射方向がテクセル境界の近くにずれるだけで大きく減衰してしまっていた。2048x1024に
-// 上げることで直径を約13テクセルに広げ、bilinear補間に対する耐性を上げている
-// (代わりに焼き込みの計算コスト・メモリはテクセル数に比例して約4倍になる)。
+// equirectテクスチャの解像度。かつては焼き込んだ太陽円盤(角半径0.02ラジアン)が
+// bilinear補間で痩せないよう1024x512から2048x1024へ上げた経緯があるが、現在は
+// 太陽円盤をテクスチャに焼き込まず表示側・利用側で解析的に描く方式に変えたため、
+// その制約は無くなっている(焼き込むのは滑らかな散乱光のみ)。水平線付近の
+// グラデーションのディテールのために現状の解像度を維持している。
 const EQUIRECT_W = 2048;
 const EQUIRECT_H = 1024;
 
@@ -348,7 +349,7 @@ fn sampleHGDirection(axis: vec3<f32>, g: f32, seed: ptr<function, u32>) -> vec3<
 // レイリー/ミー散乱/吸収のどれが起きたかを輝度加重で確率的に選び(スペクトル比はthroughputへ
 // 補正として乗算)、(4)Next Event Estimationで太陽方向への直接寄与を加算し、(5)選んだ位相関数から
 // 次方向を重点的サンプリングして継続する。
-fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn: u32, raymarchSteps: u32, stepPower: f32) -> vec3<f32> {
+fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn: u32, raymarchSteps: u32, stepPower: f32, includeSunDisc: bool) -> vec3<f32> {
   var seed = seedIn;
   var pos = vec3<f32>(0.0, PLANET_RADIUS + CAM_HEIGHT, 0.0);
   var rayDir = dirIn;
@@ -386,7 +387,14 @@ fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn:
     // 透過率を決定的な数値積分(computeSunTransmittance、内部でraySphereIntersectにより
     // 地面に遮られていれば自動的に0を返す)で計算して加算する。これによりノイズの
     // 発生源だった確率的な二値判定を、この項の計算から完全に切り離している。
-    if (bounce == 0u) {
+    //
+    // includeSunDiscがtrueになるのは検証用の直接計算モードだけ。equirect焼き込みでは
+    // 円盤をテクスチャに含めない: Reinhard+ガンマのLDR化で「空より桁違いに明るい」
+    // という輝度情報がクリップされて失われるうえ、直径十数テクセルしかない円盤は
+    // bilinear補間で痩せて不安定になるため。代わりに、自身の表示パス(fs_display)と
+    // 焼き込みPNGを利用する側(ocean-mirror.htmlなど)が、太陽の時刻から同じ円盤を
+    // 解析的に描き直す。
+    if (includeSunDisc && bounce == 0u) {
       let cosSun = dot(rayDir, sunDir);
       let discMask = smoothstep(cos(SUN_ANGULAR_RADIUS_OUTER), cos(SUN_ANGULAR_RADIUS_INNER), cosSun);
       if (discMask > 0.0) {
@@ -524,7 +532,7 @@ fn fs_trace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let dir = equirectUVToDir(uv);
   let sunDir = hourToSunDir(traceUniforms.sunHour);
 
-  let sampleColor = traceSkyPrecise(dir, sunDir, u32(traceUniforms.maxBounces), seed, u32(traceUniforms.raymarchSteps), traceUniforms.stepPower);
+  let sampleColor = traceSkyPrecise(dir, sunDir, u32(traceUniforms.maxBounces), seed, u32(traceUniforms.raymarchSteps), traceUniforms.stepPower, false);
 
   let prev = textureLoad(prevAccumTex, vec2<i32>(i32(fragCoord.x), i32(fragCoord.y)), 0).rgb;
   let n = traceUniforms.frameIndex + 1.0;
@@ -568,7 +576,9 @@ fn fs_directTrace(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<
 
   let raymarchSteps = u32(directUniforms.params.y);
   let stepPower = directUniforms.params.z;
-  let sampleColor = traceSkyPrecise(dir, sunDir, maxBounces, seed, raymarchSteps, stepPower);
+  // 直接計算モードは「最終的に画面に見えるべき真値」の参照なので、太陽円盤も
+  // HDRのままここで含める(equirect経由の表示パスはこれをmax()合成で近似する)
+  let sampleColor = traceSkyPrecise(dir, sunDir, maxBounces, seed, raymarchSteps, stepPower, true);
 
   let prev = textureLoad(prevDirectTex, vec2<i32>(i32(fragCoord.x), i32(fragCoord.y)), 0).rgb;
   let n = frameIndex + 1.0;
@@ -594,12 +604,17 @@ fn fs_resolve(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32>
 }
 `;
 
-// 表示パス: カメラのレイ方向をequirectangular UVに変換し、解決済みLDRテクスチャをサンプリングするだけ。
+// 表示パス: カメラのレイ方向をequirectangular UVに変換して解決済みLDRテクスチャをサンプリングし、
+// テクスチャに焼き込まれていない太陽円盤を解析的に重ねる。
 const displayShaderCode = commonShaderCode + vertexShaderCode + /* wgsl */ `
 struct DisplayUniforms {
   iResolution: vec2<f32>,
   sunHour: f32,
   debugMode: f32, // 0=通常 1=輝度ヒートマップ 2=散乱角ヒートマップ 3=HG位相関数分母(denom)ヒートマップ
+  raymarchSteps: f32, // 太陽円盤の透過率積分に使う(焼き込みと同じ設定値)
+  stepPower: f32,
+  _pad0: f32,
+  _pad1: f32,
 };
 @group(0) @binding(0) var<uniform> displayUniforms: DisplayUniforms;
 @group(0) @binding(1) var equirectTex: texture_2d<f32>;
@@ -658,7 +673,28 @@ fn fs_display(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32>
 
   let uv = dirToEquirectUV(dir);
   let sampled = textureSampleLevel(equirectTex, equirectSampler, uv, 0.0).rgb;
-  return vec4<f32>(sampled, 1.0);
+
+  // 太陽円盤はequirectテクスチャに焼き込まれていない(traceSkyPreciseのincludeSunDisc
+  // のコメント参照)ので、ここで解析的に描く。輝度L=E/Ω(照度を見かけの立体角に集約)と
+  // 視線方向の透過率(決定的な数値積分。夕方の赤み・地面による遮蔽はここから出る)は
+  // 焼き込んでいた頃と同じ式。
+  // 合成について: テクスチャはLDRなので厳密なHDR加算 tonemap(空 + 円盤) はできないが、
+  // 円盤の輝度(SUN_INTENSITY/Ω ≈ 1.2万)は空の散乱光より桁違いに大きく、円盤が見える
+  // 場所では tonemap(空 + 円盤) ≈ tonemap(円盤) になるため、max()で近似する。円盤が
+  // 空より暗くなる場合(日没際で透過率が小さいときなど)は自然に空の色へ沈む。
+  let sunDir = hourToSunDir(displayUniforms.sunHour);
+  let cosSun = dot(dir, sunDir);
+  let discMask = smoothstep(cos(SUN_ANGULAR_RADIUS_OUTER), cos(SUN_ANGULAR_RADIUS_INNER), cosSun);
+  var outColor = sampled;
+  if (discMask > 0.0) {
+    let camPos = vec3<f32>(0.0, PLANET_RADIUS + CAM_HEIGHT, 0.0);
+    let sunSolidAngle = 2.0 * PI * (1.0 - cos(SUN_ANGULAR_RADIUS_OUTER));
+    let steps = max(u32(displayUniforms.raymarchSteps) / 2u, 4u);
+    let viewTransmittance = computeSunTransmittance(camPos, dir, steps, displayUniforms.stepPower);
+    let discHdr = vec3<f32>(1.0, 0.98, 0.92) * discMask * (SUN_INTENSITY / sunSolidAngle) * viewTransmittance;
+    outColor = max(outColor, tonemapGamma(discHdr));
+  }
+  return vec4<f32>(outColor, 1.0);
 }
 `;
 
@@ -781,7 +817,7 @@ async function main() {
     primitive: { topology: 'triangle-list' },
   });
   const displayUniformBuffer = device.createBuffer({
-    size: 16,
+    size: 32,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   function makeDisplayBindGroup() {
@@ -929,6 +965,68 @@ async function main() {
     setStatus('太陽の時刻 ' + formatHour(sunHour) + ' で焼き込みを開始しました');
   });
 
+  // --- PNGへの焼き込み時刻の埋め込み/読み出し ---
+  // 太陽円盤はPNGに焼き込まれず、利用側が「画像+太陽の時刻」のペアから解析的に描く
+  // (traceSkyPreciseのincludeSunDiscのコメント参照)。この時刻の受け渡しを手動の
+  // スライダー合わせに頼らないよう、PNGのtEXtチャンク(キーワード "sunHour")として
+  // 埋め込み、インポート時に自動で復元する。読み出し側の同じ関数は
+  // ocean-mirror.html / ocean-gerstner.html にも複製している。
+
+  // PNG仕様のCRC-32(チャンクの型+データに対して計算し、チャンク末尾に置く)
+  function pngCrc32(bytes) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) {
+      crc ^= bytes[i];
+      for (let k = 0; k < 8; k++) {
+        crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+      }
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  // canvas.toBlob()が生成したPNGのIENDチャンク(仕様上、必ず末尾)の直前に
+  // tEXtチャンク "sunHour=<時刻>" を挿入したバイト列を返す
+  function embedSunHourInPng(pngBuffer, hour) {
+    const src = new Uint8Array(pngBuffer);
+    const payload = 'sunHour\0' + String(hour);
+    const chunk = new Uint8Array(12 + payload.length);
+    const view = new DataView(chunk.buffer);
+    view.setUint32(0, payload.length);
+    const typeAndData = 'tEXt' + payload;
+    for (let i = 0; i < typeAndData.length; i++) {
+      chunk[4 + i] = typeAndData.charCodeAt(i);
+    }
+    view.setUint32(8 + payload.length, pngCrc32(chunk.subarray(4, 8 + payload.length)));
+    const iendOffset = src.length - 12;
+    const out = new Uint8Array(src.length + chunk.length);
+    out.set(src.subarray(0, iendOffset), 0);
+    out.set(chunk, iendOffset);
+    out.set(src.subarray(iendOffset), iendOffset + chunk.length);
+    return out;
+  }
+
+  // PNGのチャンク列を走査し、tEXtチャンク "sunHour" の値を返す(無ければnull)
+  function readSunHourFromPng(pngBuffer) {
+    const bytes = new Uint8Array(pngBuffer);
+    const view = new DataView(pngBuffer);
+    let pos = 8; // PNGシグネチャの直後から
+    while (pos + 12 <= bytes.length) {
+      const len = view.getUint32(pos);
+      const type = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+      if (type === 'tEXt') {
+        const data = bytes.subarray(pos + 8, pos + 8 + len);
+        const sep = data.indexOf(0);
+        if (sep > 0 && String.fromCharCode.apply(null, data.subarray(0, sep)) === 'sunHour') {
+          const value = parseFloat(String.fromCharCode.apply(null, data.subarray(sep + 1)));
+          if (isFinite(value)) return value;
+        }
+      }
+      if (type === 'IEND') break;
+      pos += 12 + len;
+    }
+    return null;
+  }
+
   document.getElementById('exportBtn').addEventListener('click', async () => {
     setStatus('エクスポート中...');
     const bytesPerRow = EQUIRECT_W * 4;
@@ -955,14 +1053,17 @@ async function main() {
     const imageData = new ImageData(pixels, EQUIRECT_W, EQUIRECT_H);
     ctx2d.putImageData(imageData, 0, 0);
 
-    offscreen.toBlob((blob) => {
-      const url = URL.createObjectURL(blob);
+    offscreen.toBlob(async (blob) => {
+      // 焼き込み時刻をtEXtチャンクとして埋め込み、ファイル名にも入れる(人間向けの目印)
+      const withHour = embedSunHourInPng(await blob.arrayBuffer(), sunHour);
+      const fileName = 'sky-equirect-' + formatHour(sunHour).replace(':', '') + '.png';
+      const url = URL.createObjectURL(new Blob([withHour], { type: 'image/png' }));
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'sky-equirect.png';
+      a.download = fileName;
       a.click();
       URL.revokeObjectURL(url);
-      setStatus('sky-equirect.png をエクスポートしました (サンプル数 ' + frameIndex + ')');
+      setStatus(fileName + ' をエクスポートしました (サンプル数 ' + frameIndex + ', 太陽の時刻 ' + formatHour(sunHour) + ' を埋め込み)');
     }, 'image/png');
   });
 
@@ -972,6 +1073,13 @@ async function main() {
     const file = importFileInput.files[0];
     if (!file) return;
     setStatus('インポート中...');
+    // 埋め込まれた焼き込み時刻があればスライダーへ自動反映する(表示パスの解析的な
+    // 太陽円盤がインポートした空と同じ方向を向くようにするため)
+    const importedHour = readSunHourFromPng(await file.arrayBuffer());
+    if (importedHour !== null) {
+      sunHourInput.value = String(importedHour);
+      sunHourInput.dispatchEvent(new Event('input'));
+    }
     const bitmap = await createImageBitmap(file);
 
     if (bitmap.width !== equirectTexture.width || bitmap.height !== equirectTexture.height) {
@@ -991,7 +1099,8 @@ async function main() {
       [bitmap.width, bitmap.height],
     );
     liveMode = false; // 次にリセットして焼き込みを開始するまで、インポートした内容を固定表示する
-    setStatus('sky-equirect.png をインポートしました (' + bitmap.width + 'x' + bitmap.height + ')');
+    setStatus(file.name + ' をインポートしました (' + bitmap.width + 'x' + bitmap.height +
+      (importedHour !== null ? ', 太陽の時刻 ' + formatHour(importedHour) + ' を自動設定' : ', 時刻情報なし') + ')');
     importFileInput.value = '';
   });
 
@@ -1081,7 +1190,7 @@ async function main() {
       setStatus('蓄積中... サンプル数 ' + frameIndex + ' (太陽の時刻 ' + formatHour(sunHour) + ')');
     }
 
-    const displayData = new Float32Array([canvas.width, canvas.height, sunHour, debugMode]);
+    const displayData = new Float32Array([canvas.width, canvas.height, sunHour, debugMode, raymarchSteps, stepPower, 0, 0]);
     device.queue.writeBuffer(displayUniformBuffer, 0, displayData);
 
     const displayPass = encoder.beginRenderPass({

@@ -117,7 +117,7 @@
     <span class="status pending" id="skyStatus">未インポート</span>
   </div>
   <div class="row">
-    <label for="sunHour">太陽の時刻(インポート画像の焼き込み時刻に合わせる)</label>
+    <label for="sunHour">太陽の時刻(インポート時にPNGの埋め込み時刻を自動設定)</label>
   </div>
   <div class="row">
     <input id="sunHour" type="range" min="0" max="24" step="0.1" value="10">
@@ -200,8 +200,9 @@ fn dirToEquirectUV(dir: vec3<f32>) -> vec2<f32> {
 }
 
 // sky-precise.htmlがエクスポートするPNGは既にReinhardトーンマップ+ガンマ補正済みの
-// 表示用LDR画像であり、sky-precise.html自身の表示パスもこれをそのままサンプリングして
-// 出力している。この海のシェーダーもHDRへの逆変換はせず、同じ表示空間のまま
+// 表示用LDR画像であり、sky-precise.html自身の表示パスもこれをサンプリングして出力
+// している(太陽円盤だけは焼き込まれていないので表示時に解析的に重ねる。下記sunDisc
+// 参照)。この海のシェーダーもHDRへの逆変換はせず、同じ表示空間のまま
 // フレネルで水の色と混ぜて出力する(HDR蓄積バッファを持たないので、逆変換して
 // 得たとしてもトーンマップし直す先が無い)。
 // 非uniformな分岐の中から呼ぶため、textureSampleではなくtextureSampleLevelでLODを明示する
@@ -211,13 +212,14 @@ fn sampleSky(dir: vec3<f32>) -> vec3<f32> {
   return textureSampleLevel(envTex, envSampler, uv, 0.0).rgb;
 }
 
-// 太陽方向への明示的なハイライト。理屈上は完全な鏡面なので、焼き込み画像内の太陽円盤が
-// 反射方向にそのまま映り込むだけでも太陽の輝きは表現されるはずだが、equirectテクスチャ上
-// での太陽の角サイズはわずか数ピクセルしかなく、フレームバッファ解像度・4サンプルのAA・
-// bilinear補間だけでは、カメラの向きによってハイライトが消えたりチラついたりして安定して
-// 見えない。そこでテクスチャの中身に頼らず、反射方向reflDirと太陽方向sunDirの「なす角」
-// だけで解析的に円盤を描く(shaders/sky-precise.htmlの太陽円盤
-// smoothstep(cos(0.02), cos(0.009), dot(rayDir, sunDir)) と同じ考え方)。
+// 太陽の円盤(直視・反射どちらも)。sky-precise.htmlは太陽円盤をequirectテクスチャに
+// 焼き込まない方式(円盤はLDR化で輝度がクリップされ、テクセル解像度・bilinear補間で
+// 痩せて不安定だったため。詳細はsky-precise.htmlのincludeSunDiscのコメント参照)なので、
+// インポートPNGに太陽は含まれておらず、このシェーダーが太陽の時刻から解析的に描く。
+// 円盤はレイ方向(直視)または反射方向(水面)と太陽方向sunDirの「なす角」だけで決まる
+// (shaders/sky-precise.htmlの太陽円盤 smoothstep(cos(0.02), cos(0.009), dot(rayDir, sunDir))
+// と同じ考え方)。完全な平面鏡なので、直視と反射で同じ半径・強さを使えば空の太陽と
+// 水面に映る太陽が正確に一致する。
 //
 // 【重要】最初はshaders/ocean-gerstner.htmlのsunGlitter()と同じBlinn-Phong方式
 // (視線と太陽方向のハーフベクトルhalfDir=normalize(view+sun)と法線の内積のべき乗)を
@@ -265,8 +267,11 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 
     var sampleColor: vec3<f32>;
     if (rayDir.y >= -0.0005) {
-      // 水平線より上 = 空を直接見ている
+      // 水平線より上 = 空を直接見ている。インポートPNGは太陽円盤を含まないので、
+      // 反射側と同じ解析円盤をここでも重ねる(半径・強さも共通にして鏡像と一致させる)
       sampleColor = sampleSky(rayDir);
+      let disc = sunDisc(rayDir, sunDir, highlightRadius) * sunVisibilityOf(sunDir);
+      sampleColor += vec3<f32>(1.0, 0.98, 0.92) * disc * highlightIntensity;
     } else {
       // 無限に平らな鏡面(法線は常に(0,1,0))なので、反射方向はy成分の符号を
       // 反転するだけで求まり、反射点の位置は結果に影響しない
@@ -424,6 +429,32 @@ async function main() {
   });
   highlightIntensity = parseInt(highlightIntensityInput.value, 10) / 100;
 
+  // sky-precise.htmlがエクスポートするPNGには焼き込み時刻がtEXtチャンク
+  // (キーワード "sunHour")として埋め込まれている。太陽円盤はPNGに含まれず
+  // このシェーダーが時刻から解析的に描くため、時刻の取り違えは太陽の位置ズレに
+  // 直結する。インポート時に読み出してスライダーへ自動反映する。
+  // (この関数はsky-precise.html / ocean-gerstner.htmlにも複製している)
+  function readSunHourFromPng(pngBuffer) {
+    const bytes = new Uint8Array(pngBuffer);
+    const view = new DataView(pngBuffer);
+    let pos = 8; // PNGシグネチャの直後から
+    while (pos + 12 <= bytes.length) {
+      const len = view.getUint32(pos);
+      const type = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+      if (type === 'tEXt') {
+        const data = bytes.subarray(pos + 8, pos + 8 + len);
+        const sep = data.indexOf(0);
+        if (sep > 0 && String.fromCharCode.apply(null, data.subarray(0, sep)) === 'sunHour') {
+          const value = parseFloat(String.fromCharCode.apply(null, data.subarray(sep + 1)));
+          if (isFinite(value)) return value;
+        }
+      }
+      if (type === 'IEND') break;
+      pos += 12 + len;
+    }
+    return null;
+  }
+
   // 空のPNGインポート。file://で開いてもCORSに引っかからないよう、fetchではなく
   // ファイル選択ダイアログ(createImageBitmap + copyExternalImageToTexture)で読み込む。
   const skyStatus = document.getElementById('skyStatus');
@@ -433,6 +464,11 @@ async function main() {
   importSkyFile.addEventListener('change', async () => {
     const file = importSkyFile.files[0];
     if (!file) return;
+    const importedHour = readSunHourFromPng(await file.arrayBuffer());
+    if (importedHour !== null) {
+      sunHourInput.value = String(importedHour);
+      sunHourInput.dispatchEvent(new Event('input'));
+    }
     const bitmap = await createImageBitmap(file);
     envTexture.destroy();
     envTexture = createEnvTexture(bitmap.width, bitmap.height);
@@ -443,7 +479,8 @@ async function main() {
       { texture: envTexture },
       [bitmap.width, bitmap.height],
     );
-    skyStatus.textContent = 'インポート済み (' + bitmap.width + 'x' + bitmap.height + ')';
+    skyStatus.textContent = 'インポート済み (' + bitmap.width + 'x' + bitmap.height +
+      (importedHour !== null ? ', 太陽の時刻 ' + formatHour(importedHour) + ' を自動設定' : ', 時刻情報なし') + ')';
     skyStatus.classList.remove('pending');
     importSkyFile.value = '';
   });

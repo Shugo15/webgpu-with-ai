@@ -152,7 +152,7 @@
     <input id="useEnvSky" type="checkbox" disabled>
   </div>
   <div class="row" id="envSkyNote" style="display:none;color:#9c9;">
-    <span>※太陽の時刻スライダーを焼き込み時の時刻に合わせると、グリッター・透過色が空と整合します</span>
+    <span>※焼き込み時刻はPNGの埋め込みメタデータから自動設定されます(時刻情報の無い古いPNGはスライダーを焼き込み時刻に手動で合わせてください)</span>
   </div>
   <div class="row">
     <label for="debugHighlight">失敗箇所を強調表示</label>
@@ -236,13 +236,27 @@ fn sunVisibilityOf(sunDir: vec3<f32>) -> f32 {
 
 // 空気の層をどれだけ通過するか(光路長)を、水平線に近いほど長くなる
 // 単純な指数関数(1/仰角)で近似する(shaders/analytic-sky.htmlと同じモデル)。
+// 解析的な空の散乱係数(skyColorとsunDiscTermで共用)
+const SKY_RAYLEIGH_COEFF = vec3<f32>(0.1, 0.5, 2.0);
+const SKY_MIE_COEFF: f32 = 0.12;
+const SKY_MIE_G: f32 = 0.82;
+const SKY_OPTICAL_SCALE: f32 = 0.15;
+
+// 太陽円盤の寄与(解析的)。sky-precise.htmlは太陽円盤をequirectテクスチャに焼き込まない
+// 方式(表示時に解析的に描く)になったため、インポートした焼き込み空を使うときも
+// この項をskyRadiance()で加算する。輝度は解析空の円盤と同スケールに抑えてあり、
+// 粗い水面の反射レイがたまたま円盤を掠めたときのファイアフライを増やさない。
+// 水平線より下では解析空(skyColor)と同様に太陽を描かない。
+fn sunDiscTerm(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
+  let cosTheta = dot(dir, sunDir);
+  let sunElevation = max(sunDir.y, 0.02);
+  let sunTransmittance = exp(-(1.0 / sunElevation) * (SKY_RAYLEIGH_COEFF + vec3<f32>(SKY_MIE_COEFF)) * SKY_OPTICAL_SCALE);
+  let disc = smoothstep(0.9995, 0.9999, cosTheta) * sunVisibilityOf(sunDir) * step(0.0, dir.y);
+  return sunTransmittance * disc * 8.0;
+}
+
 fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
   let cosTheta = dot(dir, sunDir);
-
-  let rayleighCoeff = vec3<f32>(0.1, 0.5, 2.0);
-  let mieCoeff = 0.12;
-  let mieG = 0.82;
-  let opticalScale = 0.15;
 
   let sunVisibility = sunVisibilityOf(sunDir);
 
@@ -253,19 +267,18 @@ fn skyColor(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
   }
 
   let viewElevation = max(dir.y, 0.02);
-  let viewExtinction = exp(-(1.0 / viewElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * opticalScale);
+  let viewExtinction = exp(-(1.0 / viewElevation) * (SKY_RAYLEIGH_COEFF + vec3<f32>(SKY_MIE_COEFF)) * SKY_OPTICAL_SCALE);
 
   let sunElevation = max(sunDir.y, 0.02);
-  let sunTransmittance = exp(-(1.0 / sunElevation) * (rayleighCoeff + vec3<f32>(mieCoeff)) * opticalScale);
+  let sunTransmittance = exp(-(1.0 / sunElevation) * (SKY_RAYLEIGH_COEFF + vec3<f32>(SKY_MIE_COEFF)) * SKY_OPTICAL_SCALE);
 
-  let rayleighInscatter = rayleighCoeff * rayleighPhase(cosTheta);
-  let mieInscatter = vec3<f32>(mieCoeff) * miePhase(cosTheta, mieG);
+  let rayleighInscatter = SKY_RAYLEIGH_COEFF * rayleighPhase(cosTheta);
+  let mieInscatter = vec3<f32>(SKY_MIE_COEFF) * miePhase(cosTheta, SKY_MIE_G);
   let inscatter = (rayleighInscatter + mieInscatter) * viewExtinction * sunTransmittance;
 
   var col = inscatter * sunVisibility * 10.0;
 
-  let sunDisc = smoothstep(0.9995, 0.9999, cosTheta) * sunVisibility;
-  col += sunTransmittance * sunDisc * 8.0;
+  col += sunDiscTerm(dir, sunDir);
 
   let night = 1.0 - sunVisibility;
   let starField = step(0.997, hash21(floor(dir.xz * 400.0))) * hash21(dir.xy * 123.4);
@@ -287,9 +300,10 @@ fn dirToEquirectUV(dir: vec3<f32>) -> vec2<f32> {
 
 // sky-precise.htmlでエクスポートしたequirectangular PNG(Reinhardトーンマップ+ガンマ1/2.2の
 // LDR)を方向ベクトルでサンプリングし、逆変換でおおよその線形HDR放射輝度に戻す。
-// 逆変換はガンマ2.2 → Reinhardの逆 m/(1-m)。LDRで1.0近くに飽和した画素(太陽円盤など)は
-// 逆変換が発散するため上限をクランプする(0.98 -> HDRで49相当。焼き込み側の太陽強度15を
-// 十分カバーできる)。
+// 逆変換はガンマ2.2 → Reinhardの逆 m/(1-m)。LDRで1.0近くに飽和した画素(太陽近傍の
+// 明るい空や、旧形式のPNGに焼き込まれていた太陽円盤など)は逆変換が発散するため
+// 上限をクランプする(0.98 -> HDRで49相当。焼き込み側の太陽強度15を十分カバーできる)。
+// 現在のsky-preciseのPNGに太陽円盤は含まれず、円盤はskyRadiance()で解析的に加算する。
 // 非uniformな分岐・ループの中から呼ばれるためtextureSampleは使えず、
 // textureSampleLevelでLODを明示する(README「落とし穴」参照)。
 fn envSkyColor(dir: vec3<f32>) -> vec3<f32> {
@@ -301,9 +315,11 @@ fn envSkyColor(dir: vec3<f32>) -> vec3<f32> {
 
 // 空の放射輝度: インポートした焼き込み空(多重散乱パストレーシングの結果)があればそれを、
 // なければ従来の解析的近似(skyColor)を使う。
+// 焼き込みPNGには太陽円盤が含まれない(sky-precise.htmlが表示時に解析描画する方式)ため、
+// インポート時も解析空と同じ円盤項をここで加算する。
 fn skyRadiance(dir: vec3<f32>, sunDir: vec3<f32>) -> vec3<f32> {
   if (uniforms.params2.w > 0.5) {
-    return envSkyColor(dir);
+    return envSkyColor(dir) + sunDiscTerm(dir, sunDir);
   }
   return skyColor(dir, sunDir);
 }
@@ -919,6 +935,32 @@ async function main() {
     frameIndex = 0;
   });
 
+  // sky-precise.htmlがエクスポートするPNGには焼き込み時刻がtEXtチャンク
+  // (キーワード "sunHour")として埋め込まれている。太陽円盤はPNGに含まれず
+  // skyRadiance()が時刻から解析的に描くため、インポート時に読み出して
+  // スライダーへ自動反映する。
+  // (この関数はsky-precise.html / ocean-mirror.htmlにも複製している)
+  function readSunHourFromPng(pngBuffer) {
+    const bytes = new Uint8Array(pngBuffer);
+    const view = new DataView(pngBuffer);
+    let pos = 8; // PNGシグネチャの直後から
+    while (pos + 12 <= bytes.length) {
+      const len = view.getUint32(pos);
+      const type = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+      if (type === 'tEXt') {
+        const data = bytes.subarray(pos + 8, pos + 8 + len);
+        const sep = data.indexOf(0);
+        if (sep > 0 && String.fromCharCode.apply(null, data.subarray(0, sep)) === 'sunHour') {
+          const value = parseFloat(String.fromCharCode.apply(null, data.subarray(sep + 1)));
+          if (isFinite(value)) return value;
+        }
+      }
+      if (type === 'IEND') break;
+      pos += 12 + len;
+    }
+    return null;
+  }
+
   // 焼き込み空(sky-precise.htmlでエクスポートしたequirectangular PNG)のインポート。
   // file://で開いてもCORSに引っかからないよう、fetchではなくファイル選択ダイアログ
   // (createImageBitmap + copyExternalImageToTexture)で読み込む。
@@ -930,6 +972,12 @@ async function main() {
   importSkyFile.addEventListener('change', async () => {
     const file = importSkyFile.files[0];
     if (!file) return;
+    // 埋め込みの焼き込み時刻を反映(inputイベント経由なので蓄積リセットも既存処理に任せる)
+    const importedHour = readSunHourFromPng(await file.arrayBuffer());
+    if (importedHour !== null) {
+      sunHourInput.value = String(importedHour);
+      sunHourInput.dispatchEvent(new Event('input'));
+    }
     const bitmap = await createImageBitmap(file);
     if (bitmap.width !== envTexture.width || bitmap.height !== envTexture.height) {
       envTexture.destroy();
