@@ -218,8 +218,12 @@ fn sampleSky(dir: vec3<f32>) -> vec3<f32> {
 // インポートPNGに太陽は含まれておらず、このシェーダーが太陽の時刻から解析的に描く。
 // 円盤はレイ方向(直視)または反射方向(水面)と太陽方向sunDirの「なす角」だけで決まる
 // (shaders/sky-precise.htmlの太陽円盤 smoothstep(cos(0.02), cos(0.009), dot(rayDir, sunDir))
-// と同じ考え方)。完全な平面鏡なので、直視と反射で同じ半径・強さを使えば空の太陽と
-// 水面に映る太陽が正確に一致する。
+// と同じ考え方)。ただし半径・強さの扱いは直視と反射で分ける:
+// - 直視(空)の太陽は「実物」なので、実際の太陽の見かけの角半径(SUN_ANGULAR_RADIUS、
+//   sky-precise.htmlの円盤と同じ0.02ラジアン)と固定の強さで描き、スライダーの影響を受けない
+// - 反射(水面)のハイライトは「ハイライトの鋭さ/強さ」スライダーで演出的に調整できる
+//   (レンズのにじみに相当する広がりの表現)。最も鋭い設定にすると直視の太陽と
+//   ほぼ同じ大きさになり、完全な平面鏡としての鏡像に一致する
 //
 // 【重要】最初はshaders/ocean-gerstner.htmlのsunGlitter()と同じBlinn-Phong方式
 // (視線と太陽方向のハーフベクトルhalfDir=normalize(view+sun)と法線の内積のべき乗)を
@@ -236,6 +240,10 @@ fn sunDisc(reflDir: vec3<f32>, sunDir: vec3<f32>, outerRadius: f32) -> f32 {
   let cosInner = cos(outerRadius * 0.45);
   return smoothstep(cosOuter, cosInner, cosAngle);
 }
+
+// 実際の太陽の見かけの角半径(sky-precise.htmlのSUN_ANGULAR_RADIUS_OUTERと同じ)。
+// 直視の太陽円盤はこの固定値で描く(ハイライトのスライダーは反射側だけに効く)
+const SUN_ANGULAR_RADIUS: f32 = 0.02;
 
 @fragment
 fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
@@ -268,10 +276,11 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     var sampleColor: vec3<f32>;
     if (rayDir.y >= -0.0005) {
       // 水平線より上 = 空を直接見ている。インポートPNGは太陽円盤を含まないので、
-      // 反射側と同じ解析円盤をここでも重ねる(半径・強さも共通にして鏡像と一致させる)
+      // 実際の太陽サイズの解析円盤をここで重ねる。これは「実物」なので、
+      // ハイライトの鋭さ/強さスライダー(反射の演出用)の影響は受けない
       sampleColor = sampleSky(rayDir);
-      let disc = sunDisc(rayDir, sunDir, highlightRadius) * sunVisibilityOf(sunDir);
-      sampleColor += vec3<f32>(1.0, 0.98, 0.92) * disc * highlightIntensity;
+      let disc = sunDisc(rayDir, sunDir, SUN_ANGULAR_RADIUS) * sunVisibilityOf(sunDir);
+      sampleColor += vec3<f32>(1.0, 0.98, 0.92) * disc;
     } else {
       // 無限に平らな鏡面(法線は常に(0,1,0))なので、反射方向はy成分の符号を
       // 反転するだけで求まり、反射点の位置は結果に影響しない
