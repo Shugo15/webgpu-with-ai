@@ -124,8 +124,11 @@
     <span class="val" id="sunHourVal">10:00</span>
   </div>
   <div class="row">
-    <label for="waterColor">水の色(透過)</label>
-    <input id="waterColor" type="color" value="#04174d">
+    <label for="turbidity">水の濁り(懸濁粒子の量)</label>
+  </div>
+  <div class="row">
+    <input id="turbidity" type="range" min="0" max="100" step="1" value="10">
+    <span class="val" id="turbidityVal">10%</span>
   </div>
   <div class="row">
     <label for="highlightSharpness">ハイライトの鋭さ</label>
@@ -157,19 +160,21 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f
 `;
 
 // 海面を波のない完全な平面(y=0)として扱い、shaders/sky-precise.htmlで焼き込んだ
-// equirectangular PNGを空として反射させるだけの、最も単純な海。
+// equirectangular PNGを空として反射させる海。
 // ガーストナー波(shaders/ocean-gerstner.html)のような高さフィールドの探索・粗さによる
-// 散乱・白波は持たないが、太陽方向への明示的なハイライト(sunGlitter())は追加している
-// (下記コメント参照)。無限に平らな鏡面なので反射方向は視線方向だけで決まり
-// (法線が(0,1,0)で一定なため、水面上のどの位置で反射しても結果は同じ)、交差点の座標自体は
-// 計算に使わない。そのため蓄積(時間積分)も不要で、フレームごとに再計算するだけの
-// リアルタイム描画になっている。
+// 表面散乱・白波は持たないが、太陽方向への明示的なハイライト(sunDisc())と、
+// 水面下の海中の単散乱(waterRadiance()。吸収・散乱係数から閉形式で厳密に積分する。
+// 水の色はハードコードせず、純水の吸収の波長依存から自然に青が出る)を計算する。
+// 無限に平らな鏡面なので反射方向は視線方向だけで決まり(法線が(0,1,0)で一定なため、
+// 水面上のどの位置で反射しても結果は同じ)、交差点の座標自体は計算に使わない。
+// 海中の閉形式積分も乱数を使わない決定的な計算なので、蓄積(時間積分)は不要で、
+// フレームごとに再計算するだけのリアルタイム描画になっている。
 const traceShaderCode = /* wgsl */ `
 ${vertexShaderCode}
 
 struct Uniforms {
-  resAndSun: vec4<f32>,  // xy = resolution, z = sunHour(太陽の時刻), w = ハイライト円盤の半径(ラジアン)
-  waterColor: vec4<f32>, // rgb = フレネル透過成分の色(水そのものの色), a = ハイライト強度
+  resAndSun: vec4<f32>,   // xy = resolution, z = sunHour(太陽の時刻), w = ハイライト円盤の半径(ラジアン)
+  waterParams: vec4<f32>, // x = 濁り(0..1), y = ハイライト強度, zw = 未使用
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var envTex: texture_2d<f32>;
@@ -202,14 +207,100 @@ fn dirToEquirectUV(dir: vec3<f32>) -> vec2<f32> {
 // sky-precise.htmlがエクスポートするPNGは既にReinhardトーンマップ+ガンマ補正済みの
 // 表示用LDR画像であり、sky-precise.html自身の表示パスもこれをサンプリングして出力
 // している(太陽円盤だけは焼き込まれていないので表示時に解析的に重ねる。下記sunDisc
-// 参照)。この海のシェーダーもHDRへの逆変換はせず、同じ表示空間のまま
-// フレネルで水の色と混ぜて出力する(HDR蓄積バッファを持たないので、逆変換して
-// 得たとしてもトーンマップし直す先が無い)。
+// 参照)。この海のシェーダーでは、空の反射はこのLDRを表示空間のまま使い、
+// 海中の散乱(waterRadiance)だけ線形HDRで計算して同じReinhard+ガンマ(tonemapGamma)で
+// 表示空間へ変換してから合成する。焼き込みと同じトーンカーブを通すので明るさの
+// スケールが揃う(HDR蓄積バッファを持たないので、空をHDRへ逆変換して合成し直す構成は
+// 取らない)。
 // 非uniformな分岐の中から呼ぶため、textureSampleではなくtextureSampleLevelでLODを明示する
 // (README「落とし穴」参照: 非uniform制御フロー内でtextureSampleは呼べない)。
 fn sampleSky(dir: vec3<f32>) -> vec3<f32> {
   let uv = dirToEquirectUV(dir);
   return textureSampleLevel(envTex, envSampler, uv, 0.0).rgb;
+}
+
+// ---- 海中の散乱 ----
+// 水の色は一切ハードコードせず、海水の光学係数(吸収・散乱の波長依存)から計算で出す。
+// 純水の吸収係数(1/m)。赤ほど強く吸収される(Pope & Fry 1997の実測の代表値)。
+// 「海が青い」のはこの吸収の波長依存が主因。
+const WATER_ABSORPTION = vec3<f32>(0.45, 0.063, 0.0092);
+// 純海水の分子散乱係数(1/m)。レイリー散乱と同様に短波長(青)ほど強い。
+const WATER_MOL_SCATTER = vec3<f32>(0.0017, 0.0032, 0.0062);
+// 濁り(懸濁粒子)スライダー最大時の粒子散乱係数(1/m)。粒子は大きいので波長依存はほぼ無い。
+const PARTICLE_SCATTER_MAX = vec3<f32>(0.08, 0.08, 0.08);
+// 濁り最大時の粒子(植物プランクトン等)の吸収係数(1/m)。クロロフィルは青と赤を
+// 吸収して緑を残すため、濁った水は自然に緑側へ寄る。
+const PARTICLE_ABSORPTION_MAX = vec3<f32>(0.06, 0.008, 0.09);
+const WATER_IOR: f32 = 1.33;
+// 太陽の照度。sky-precise.htmlのSUN_INTENSITYと同じ値を使い、同じReinhard+ガンマで
+// トーンマップすることで、インポートした空の明るさとスケールを揃える。
+const SUN_INTENSITY: f32 = 15.0;
+
+// 位相関数(どちらもsky-precise.htmlと同じ式)
+fn rayleighPhase(cosTheta: f32) -> f32 {
+  return 3.0 / (16.0 * PI) * (1.0 + cosTheta * cosTheta);
+}
+fn hgPhase(cosTheta: f32, g: f32) -> f32 {
+  let g2 = g * g;
+  let denom = 1.0 + g2 - 2.0 * g * cosTheta;
+  return (1.0 - g2) / (4.0 * PI * pow(max(denom, 1e-4), 1.5));
+}
+
+// sky-precise.htmlのresolveパスと同じReinhard+ガンマ。海中の散乱は線形HDRで計算し、
+// 空の焼き込みと同じこのカーブで表示空間へ変換して合成する
+fn tonemapGamma(color: vec3<f32>) -> vec3<f32> {
+  let mapped = color / (color + vec3<f32>(1.0));
+  return pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+}
+
+// Schlick近似のフレネル反射率(空気->水、垂直入射で0.02)
+fn schlickFresnel(cosTheta: f32) -> f32 {
+  let f0 = 0.02;
+  return f0 + (1.0 - f0) * pow(1.0 - max(cosTheta, 0.0), 5.0);
+}
+
+// 水面下の単散乱を閉形式で厳密に積分した、水中から水面へ向かう上向き放射輝度(線形HDR)。
+//
+// モデル: 水は均質で無限に深い。太陽の平行光が水面で屈折して差し込み(フレネル透過)、
+// 屈折した視線の経路上の各点で1回散乱して眼に届く。経路上の距離sの点は
+// 深さ z = s*dy (dy = 屈折視線の下向き成分)にあり、そこへ届く太陽光の水中経路長は
+// z/sy (sy = 屈折太陽光の下向き成分)。消散係数c(吸収+散乱)による減衰を両経路に掛けると
+//   L = Σ_i b_i P_i(θ) E_uw ∫[0,∞) exp(-c s) exp(-c s dy/sy) ds
+//     = Σ_i b_i P_i(θ) E_uw / (c (1 + dy/sy))
+// と解析的に積分できる(iは分子散乱/粒子散乱。係数b_iと位相関数P_iが異なる)。
+// レイマーチも乱数も不要な決定的計算なので、このシェーダーの1パス構成のまま使える。
+//
+// 既知の簡略化: 多重散乱は含まない(散乱アルベドb/cが大きい濁った水ほど過小評価)。
+// 太陽光の大気透過(夕方の赤み)はsunVisibilityOfの減光のみで近似。海底・浮遊物は無い。
+fn waterRadiance(rayDir: vec3<f32>, sunDir: vec3<f32>, turbidity: f32, skyZenithLinear: vec3<f32>) -> vec3<f32> {
+  let up = vec3<f32>(0.0, 1.0, 0.0);
+  // 空気->水の屈折。視線(下向き)と、太陽光の進行方向(-sunDir)の両方
+  let viewW = refract(rayDir, up, 1.0 / WATER_IOR);
+  let sunW = refract(-sunDir, up, 1.0 / WATER_IOR);
+  let dy = max(-viewW.y, 1e-3);
+  let sy = max(-sunW.y, 1e-3);
+
+  let bMol = WATER_MOL_SCATTER;
+  let bPart = PARTICLE_SCATTER_MAX * turbidity;
+  let extinction = WATER_ABSORPTION + PARTICLE_ABSORPTION_MAX * turbidity + bMol + bPart;
+
+  // 散乱角: 水中を進む太陽光(sunW)から、眼へ向かう方向(-viewW)への散乱
+  let cosTheta = dot(sunW, -viewW);
+  // 水面直下の太陽照度(ビームに垂直な面での照度。sky-preciseのNEEと同じ規約)。
+  // 水面のフレネル透過(1-F)を掛け、夜はsunVisibilityOfで消灯する
+  let eUnderwater = vec3<f32>(1.0, 0.98, 0.92) * SUN_INTENSITY * sunVisibilityOf(sunDir)
+                  * (1.0 - schlickFresnel(max(sunDir.y, 0.0)));
+  let pathFactor = 1.0 / (extinction * (1.0 + dy / sy));
+  // 粒子の位相関数は強い前方散乱(Petzold測定の代表値 g≈0.924 のHenyey-Greenstein)
+  var radiance = (bMol * rayleighPhase(cosTheta) + bPart * hgPhase(cosTheta, 0.924)) * eUnderwater * pathFactor;
+
+  // 天空光(太陽以外の空全体からの拡散光)の寄与の近似。天頂の空の輝度を代表値として
+  // 半球一様な入射(照度 = π * 輝度)とみなし、等方位相 1/(4π)・拡散光の平均斜入射による
+  // 経路の伸び(係数2)で直達光と同じ閉形式を流用する。厳密な積分ではないが、
+  // 直達光が弱い朝夕や日陰側で水が不自然な真っ黒になるのを防ぐ
+  radiance += skyZenithLinear * PI * (bMol + bPart) * (1.0 / (4.0 * PI)) / (extinction * (1.0 + 2.0 * dy));
+
+  return radiance;
 }
 
 // 太陽の円盤(直視・反射どちらも)。sky-precise.htmlは太陽円盤をequirectテクスチャに
@@ -250,9 +341,16 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let res = uniforms.resAndSun.xy;
   let sunHour = uniforms.resAndSun.z;
   let sunDir = hourToSunDir(sunHour);
-  let transmissionColor = uniforms.waterColor.rgb * sunVisibilityOf(sunDir);
   let highlightRadius = uniforms.resAndSun.w;
-  let highlightIntensity = uniforms.waterColor.a;
+  let turbidity = uniforms.waterParams.x;
+  let highlightIntensity = uniforms.waterParams.y;
+
+  // 天空光の代表値としてインポートした空の天頂輝度を1回サンプリングし、LDR(トーンマップ済み)
+  // から逆Reinhard(ガンマ2.2 -> m/(1-m)、飽和対策で0.98にクランプ)で概算の線形HDRへ戻す。
+  // waterRadiance()の天空光項で使う
+  let zenithLdr = sampleSky(vec3<f32>(0.0, 1.0, 0.0));
+  let zenithMapped = min(pow(max(zenithLdr, vec3<f32>(0.0)), vec3<f32>(2.2)), vec3<f32>(0.98));
+  let skyZenithLinear = zenithMapped / (vec3<f32>(1.0) - zenithMapped);
 
   // 固定カメラ(水平方向を向く。shaders/ocean-gerstner.htmlと同じ配置)
   let eye = vec3<f32>(0.0, 2.5, 0.0);
@@ -289,10 +387,14 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 
       // Fresnel(Schlick近似): dot(視線, 法線) = dot(-rayDir, (0,1,0)) = -rayDir.y
       let cosTheta = max(-rayDir.y, 0.0);
-      let f0 = 0.02; // 空気->水の垂直入射反射率(屈折率1.33相当)
-      let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+      let fresnel = schlickFresnel(cosTheta);
 
-      var waterColorResult = mix(transmissionColor, sky, fresnel);
+      // 海中の単散乱(線形HDR)。水中から空気へ出るときのフレネル透過(1-F)と、
+      // 屈折率n^2による放射輝度の圧縮(水中の輝度は空気側でL/n^2になる)を線形側で
+      // 掛けてから、焼き込みと同じトーンカーブで表示空間へ変換する
+      let underwater = waterRadiance(rayDir, sunDir, turbidity, skyZenithLinear)
+                     * (1.0 - fresnel) / (WATER_IOR * WATER_IOR);
+      var waterColorResult = tonemapGamma(underwater) + sky * fresnel;
       let disc = sunDisc(reflDir, sunDir, highlightRadius) * sunVisibilityOf(sunDir);
       waterColorResult += vec3<f32>(1.0, 0.98, 0.92) * disc * highlightIntensity;
       sampleColor = waterColorResult;
@@ -385,9 +487,8 @@ async function main() {
   window.addEventListener('resize', resize);
   resize();
 
-  // UI: 太陽の時刻(インポート画像との整合用) / 水の色
+  // UI: 太陽の時刻(インポート画像との整合用) / 水の濁り
   let sunHour = 10.0;
-  let waterColor = [0, 0, 0];
 
   const sunHourInput = document.getElementById('sunHour');
   const sunHourVal = document.getElementById('sunHourVal');
@@ -401,16 +502,16 @@ async function main() {
     sunHourVal.textContent = formatHour(sunHour);
   });
 
-  function hexToRgb(hex) {
-    const v = parseInt(hex.slice(1), 16);
-    return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255];
-  }
-
-  const waterColorInput = document.getElementById('waterColor');
-  waterColor = hexToRgb(waterColorInput.value);
-  waterColorInput.addEventListener('input', () => {
-    waterColor = hexToRgb(waterColorInput.value);
+  // 水の濁り(0..1)。海中の散乱係数・吸収係数へのスケールとしてシェーダーに渡す
+  // (水の色そのものは選ばせず、光学係数から計算で色が出る)
+  let turbidity = 0.1;
+  const turbidityInput = document.getElementById('turbidity');
+  const turbidityVal = document.getElementById('turbidityVal');
+  turbidityInput.addEventListener('input', () => {
+    turbidity = parseInt(turbidityInput.value, 10) / 100;
+    turbidityVal.textContent = turbidityInput.value + '%';
   });
+  turbidity = parseInt(turbidityInput.value, 10) / 100;
 
   // ハイライト円盤の半径(ラジアン)・強さ(倍率)。円盤の半径は反射方向と太陽方向の
   // 「なす角」だけで決まる(shaders/sky-precise.htmlの太陽円盤と同じ考え方)ため、
@@ -501,10 +602,10 @@ async function main() {
     uniformData[1] = canvas.height;
     uniformData[2] = sunHour;
     uniformData[3] = highlightRadius;
-    uniformData[4] = waterColor[0];
-    uniformData[5] = waterColor[1];
-    uniformData[6] = waterColor[2];
-    uniformData[7] = highlightIntensity;
+    uniformData[4] = turbidity;
+    uniformData[5] = highlightIntensity;
+    uniformData[6] = 0;
+    uniformData[7] = 0;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
     const encoder = device.createCommandEncoder();
