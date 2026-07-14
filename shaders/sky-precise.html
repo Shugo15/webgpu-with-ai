@@ -349,9 +349,17 @@ fn traceSkyPrecise(dirIn: vec3<f32>, sunDir: vec3<f32>, maxBounces: u32, seedIn:
       if (hitsGround) {
         radiance += throughput * vec3<f32>(0.02, 0.02, 0.025);
       } else {
-        let cosSun = dot(rayDir, sunDir);
-        let sunDisc = smoothstep(cos(0.02), cos(0.009), cosSun);
-        radiance += throughput * vec3<f32>(1.0, 0.98, 0.92) * sunDisc * SUN_INTENSITY;
+        // 太陽円盤そのものは、まだ一度も散乱していないカメラの主レイ(bounce==0)でだけ加算する。
+        // 散乱後(bounce>0)は、各衝突点で既にNext Event Estimationにより太陽への直接寄与を
+        // 明示的に加算済みなので、そこでランダムに選んだ続きの方向がたまたま太陽の位置と
+        // 一致した場合にも同じ寄与を二重に数えてしまうと、稀にしか起きない代わりに大きな値を
+        // 持つ「ホタル」ノイズの主因になる(サンプル数を増やすほど新しいホタルが出現する頻度が
+        // 増え、むしろノイズが目立って見える)。
+        if (bounce == 0u) {
+          let cosSun = dot(rayDir, sunDir);
+          let sunDisc = smoothstep(cos(0.02), cos(0.009), cosSun);
+          radiance += throughput * vec3<f32>(1.0, 0.98, 0.92) * sunDisc * SUN_INTENSITY;
+        }
         let isNight = smoothstep(0.05, -0.15, sunDir.y);
         let starField = step(0.997, hash21(floor(rayDir.xz * 400.0))) * hash21(rayDir.xy * 123.4);
         radiance += throughput * vec3<f32>(starField) * isNight * 0.5;
