@@ -137,8 +137,8 @@
   </div>
   <div class="row">
     <label for="highlightSharpness">ハイライトの鋭さ</label>
-    <input id="highlightSharpness" type="range" min="1" max="100" step="1" value="60">
-    <span class="val" id="highlightSharpnessVal">60</span>
+    <input id="highlightSharpness" type="range" min="1" max="100" step="1" value="100">
+    <span class="val" id="highlightSharpnessVal">100</span>
   </div>
   <div class="row">
     <label for="highlightIntensity">ハイライトの強さ</label>
@@ -631,7 +631,7 @@ async function main() {
   // 視線角度によらず常に真円になる。鋭さのスライダーは対数的に半径へマッピングする
   // (線形だとハイライトの見た目の変化が高い側に偏ってしまうため)。最も鋭い側は
   // sky-precise.htmlの太陽円盤(外側半径0.02ラジアン)とほぼ同じ大きさにしてある。
-  let highlightRadius = 0.05;
+  let highlightRadius = 0.02;
   let highlightIntensity = 1.0;
 
   const highlightSharpnessInput = document.getElementById('highlightSharpness');
