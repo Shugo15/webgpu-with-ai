@@ -260,10 +260,23 @@ fn tonemapGamma(color: vec3<f32>) -> vec3<f32> {
   return pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
 }
 
-// Schlick近似のフレネル反射率(空気->水、垂直入射で0.02)
-fn schlickFresnel(cosTheta: f32) -> f32 {
-  let f0 = 0.02;
-  return f0 + (1.0 - f0) * pow(1.0 - max(cosTheta, 0.0), 5.0);
+// 厳密な(s偏光・p偏光を平均した無偏光)フレネル反射率。Schlick近似は入射角θiだけの
+// べき乗式(F0からの補間)で、屈折角θiを一切使わない。ここではSnellの法則
+// n1 sinθi = n2 sinθt で屈折角θtを陽に求め、厳密なフレネル方程式
+//   Rs = ((n1 cosθi - n2 cosθt) / (n1 cosθi + n2 cosθt))²
+//   Rp = ((n1 cosθt - n2 cosθi) / (n1 cosθt + n2 cosθi))²
+// にθi・θtの両方を使う(無偏光なのでRs・Rpの平均)。垂直入射(θi=0)では
+// Schlickと同じ((n2-n1)/(n2+n1))² ≈ 0.02(空気→水、n1=1, n2=1.33)に一致するが、
+// 中間角度での立ち上がり方はSchlickの5乗近似とわずかに異なる。
+// n1<n2(空気→水)では全反射は起こらないが、sin²θtを1.0でクランプして安全にしておく。
+fn exactFresnel(cosThetaI: f32, n1: f32, n2: f32) -> f32 {
+  let ci = clamp(cosThetaI, 0.0, 1.0);
+  let eta = n1 / n2;
+  let sin2ThetaT = min(eta * eta * (1.0 - ci * ci), 1.0);
+  let cosThetaT = sqrt(1.0 - sin2ThetaT);
+  let rs = (n1 * ci - n2 * cosThetaT) / (n1 * ci + n2 * cosThetaT);
+  let rp = (n1 * cosThetaT - n2 * ci) / (n1 * cosThetaT + n2 * ci);
+  return (rs * rs + rp * rp) * 0.5;
 }
 
 // ---- 海底 ----
@@ -358,7 +371,7 @@ fn waterRadiance(rayDir: vec3<f32>, sunDir: vec3<f32>, turbidity: f32, skyZenith
   // 水面直下の太陽照度(ビームに垂直な面での照度。sky-preciseのNEEと同じ規約)。
   // 水面のフレネル透過(1-F)を掛け、夜はsunVisibilityOfで消灯する
   let eUnderwater = vec3<f32>(1.0, 0.98, 0.92) * SUN_INTENSITY * sunVisibilityOf(sunDir)
-                  * (1.0 - schlickFresnel(max(sunDir.y, 0.0)));
+                  * (1.0 - exactFresnel(max(sunDir.y, 0.0), 1.0, WATER_IOR));
   let kSun = extinction * (1.0 + dy / sy);
   let pathFactor = (1.0 - exp(-kSun * sMax)) / kSun;
   // 粒子の位相関数は強い前方散乱(Petzold測定の代表値 g≈0.924 のHenyey-Greenstein)
@@ -468,9 +481,10 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
       let reflDir = vec3<f32>(rayDir.x, -rayDir.y, rayDir.z);
       let sky = sampleSky(reflDir);
 
-      // Fresnel(Schlick近似): dot(視線, 法線) = dot(-rayDir, (0,1,0)) = -rayDir.y
+      // Fresnel(厳密な式。屈折角はSnellの法則から内部で求める):
+      // dot(視線, 法線) = dot(-rayDir, (0,1,0)) = -rayDir.y
       let cosTheta = max(-rayDir.y, 0.0);
-      let fresnel = schlickFresnel(cosTheta);
+      let fresnel = exactFresnel(cosTheta, 1.0, WATER_IOR);
 
       // 視線が水面(y=0)に入射する点。海底の模様の位置決めに使う
       // (この分岐はrayDir.y < -0.0005が保証されているのでゼロ除算しない)
