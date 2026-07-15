@@ -145,6 +145,14 @@
     <input id="highlightIntensity" type="range" min="0" max="500" step="10" value="100">
     <span class="val" id="highlightIntensityVal">100%</span>
   </div>
+  <div class="row">
+    <label for="debugHighlight">フォールバック箇所を強調表示</label>
+    <input id="debugHighlight" type="checkbox">
+  </div>
+  <div class="row">
+    <label for="debugColor">強調表示の色</label>
+    <input id="debugColor" type="color" value="#ff00ff">
+  </div>
 </div>
 <input id="importSkyFile" type="file" accept="image/png" style="display:none">
 <canvas id="gpuCanvas"></canvas>
@@ -186,6 +194,7 @@ ${vertexShaderCode}
 struct Uniforms {
   resAndSun: vec4<f32>,   // xy = resolution, z = sunHour(太陽の時刻), w = 波のアニメーション時刻(秒)
   waterParams: vec4<f32>, // x = 濁り(0..1), y = ハイライト強度, z = 海の深さ(m), w = 描画距離(m)
+  debugParams: vec4<f32>, // x = フォールバック箇所の強調表示(0/1), yzw = 強調表示の色
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var envTex: texture_2d<f32>;
@@ -622,6 +631,8 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let highlightIntensity = uniforms.waterParams.y;
   let seaDepth = uniforms.waterParams.z;
   let renderDistance = uniforms.waterParams.w;
+  let debugHighlight = uniforms.debugParams.x > 0.5;
+  let debugColor = uniforms.debugParams.yzw;
 
   // 天空光の代表値としてインポートした空の天頂輝度を1回サンプリングし、LDR(トーンマップ済み)
   // から逆Reinhard(ガンマ2.2 -> m/(1-m)、飽和対策で0.98にクランプ)で概算の線形HDRへ戻す。
@@ -659,10 +670,17 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
       sampleColor += vec3<f32>(1.0, 0.98, 0.92) * disc;
     } else {
       // レイと波の高さフィールドの実際の交点をレイマーチング+二分探索で求める。
-      // 描画距離内に見つからなかった(水平線際の極端に浅い角度)場合は空とみなす。
+      // 描画距離内に見つからなかった(水平線際の極端に浅い角度、またはWAVE_HEIGHT_MARGIN
+      // による早期打ち切り)場合は空とみなす。この「見つからなかった」判定自体は
+      // 描画距離を伸ばせば解消できるので、強調表示オプションでどこがそうなっているか
+      // (=描画距離が足りていない箇所)を確認できるようにしている。
       let hit = intersectWater(eye, rayDir, waveTime, renderDistance);
       if (hit.w < 0.5) {
-        sampleColor = sampleSky(rayDir);
+        if (debugHighlight) {
+          sampleColor = debugColor;
+        } else {
+          sampleColor = sampleSky(rayDir);
+        }
       } else {
         let hitPos = hit.xyz;
         // 交点での波の法線。roughnessゼロの完全な鏡面なので、この1点の法線だけで
@@ -729,7 +747,7 @@ async function main() {
   });
 
   const uniformBuffer = device.createBuffer({
-    size: 32,
+    size: 48,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -846,6 +864,24 @@ async function main() {
   });
   highlightIntensity = parseInt(highlightIntensityInput.value, 10) / 100;
 
+  // フォールバック箇所(intersectWater()が描画距離内に交点を見つけられなかった箇所。
+  // 描画距離が足りていない水平線際に出る)の強調表示
+  function hexToRgb(hex) {
+    const v = parseInt(hex.slice(1), 16);
+    return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255];
+  }
+  let debugHighlight = false;
+  let debugColor = [1, 0, 1];
+  const debugHighlightInput = document.getElementById('debugHighlight');
+  debugHighlightInput.addEventListener('input', () => {
+    debugHighlight = debugHighlightInput.checked;
+  });
+  const debugColorInput = document.getElementById('debugColor');
+  debugColor = hexToRgb(debugColorInput.value);
+  debugColorInput.addEventListener('input', () => {
+    debugColor = hexToRgb(debugColorInput.value);
+  });
+
   // sky-precise.htmlがエクスポートするPNGには焼き込み時刻がtEXtチャンク
   // (キーワード "sunHour")として埋め込まれている。太陽円盤はPNGに含まれず
   // このシェーダーが時刻から解析的に描くため、時刻の取り違えは太陽の位置ズレに
@@ -902,7 +938,7 @@ async function main() {
     importSkyFile.value = '';
   });
 
-  const uniformData = new Float32Array(8);
+  const uniformData = new Float32Array(12);
 
   // 波のアニメーション時刻。粗さによるモンテカルロノイズが無く蓄積バッファも
   // 持たないため、shaders/ocean-gerstner.htmlと違って一時停止せず常時動かせる。
@@ -917,6 +953,10 @@ async function main() {
     uniformData[5] = highlightIntensity;
     uniformData[6] = seaDepth;
     uniformData[7] = renderDistance;
+    uniformData[8] = debugHighlight ? 1 : 0;
+    uniformData[9] = debugColor[0];
+    uniformData[10] = debugColor[1];
+    uniformData[11] = debugColor[2];
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
     const encoder = device.createCommandEncoder();
