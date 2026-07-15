@@ -136,6 +136,11 @@
     <span class="val" id="seaDepthVal">5.0m</span>
   </div>
   <div class="row">
+    <label for="renderDistance">描画距離</label>
+    <input id="renderDistance" type="range" min="20" max="500" step="10" value="100">
+    <span class="val" id="renderDistanceVal">100</span>
+  </div>
+  <div class="row">
     <label for="highlightIntensity">ハイライトの強さ</label>
     <input id="highlightIntensity" type="range" min="0" max="500" step="10" value="100">
     <span class="val" id="highlightIntensityVal">100%</span>
@@ -180,7 +185,7 @@ ${vertexShaderCode}
 
 struct Uniforms {
   resAndSun: vec4<f32>,   // xy = resolution, z = sunHour(太陽の時刻), w = 波のアニメーション時刻(秒)
-  waterParams: vec4<f32>, // x = 濁り(0..1), y = ハイライト強度, z = 海の深さ(m), w = 未使用
+  waterParams: vec4<f32>, // x = 濁り(0..1), y = ハイライト強度, z = 海の深さ(m), w = 描画距離(m)
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var envTex: texture_2d<f32>;
@@ -329,9 +334,6 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
   return WaveSample(normal, height);
 }
 
-// カメラの視線が届く範囲(この距離を超えて水面が見つからなければ空とみなす)。
-// ocean-gerstner.htmlの描画距離スライダーのデフォルトと同程度の値を固定で使う。
-const WATER_RENDER_DISTANCE: f32 = 100.0;
 
 // レイと実際の波面(高さフィールド)の交差点を、区間探索+二分探索で求める
 // (shaders/ocean-gerstner.htmlのintersectWater()と同じアルゴリズム)。
@@ -559,6 +561,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let turbidity = uniforms.waterParams.x;
   let highlightIntensity = uniforms.waterParams.y;
   let seaDepth = uniforms.waterParams.z;
+  let renderDistance = uniforms.waterParams.w;
 
   // 天空光の代表値としてインポートした空の天頂輝度を1回サンプリングし、LDR(トーンマップ済み)
   // から逆Reinhard(ガンマ2.2 -> m/(1-m)、飽和対策で0.98にクランプ)で概算の線形HDRへ戻す。
@@ -597,7 +600,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     } else {
       // レイと波の高さフィールドの実際の交点をレイマーチング+二分探索で求める。
       // 描画距離内に見つからなかった(水平線際の極端に浅い角度)場合は空とみなす。
-      let hit = intersectWater(eye, rayDir, waveTime, WATER_RENDER_DISTANCE);
+      let hit = intersectWater(eye, rayDir, waveTime, renderDistance);
       if (hit.w < 0.5) {
         sampleColor = sampleSky(rayDir);
       } else {
@@ -756,6 +759,19 @@ async function main() {
   });
   seaDepth = parseFloat(seaDepthInput.value);
 
+  // 描画距離(m)。intersectWater()のレイマーチング探索範囲の上限で、これを超えて
+  // 波面が見つからなければ空とみなす(shaders/ocean-gerstner.htmlの描画距離スライダーと
+  // 同じ役割・レンジ)。波の追加でレイマーチングが必要になったため、以前は固定値
+  // (100m)だったのをスライダーで調整できるようにした。
+  let renderDistance = 100.0;
+  const renderDistanceInput = document.getElementById('renderDistance');
+  const renderDistanceVal = document.getElementById('renderDistanceVal');
+  renderDistanceInput.addEventListener('input', () => {
+    renderDistance = parseFloat(renderDistanceInput.value);
+    renderDistanceVal.textContent = String(renderDistance);
+  });
+  renderDistance = parseFloat(renderDistanceInput.value);
+
   // ハイライトの強さ(倍率)。円盤自体の半径はシェーダー側の物理定数
   // (SUN_ANGULAR_RADIUS、実際の太陽の見かけの角半径)固定で、roughness=0の平面鏡である
   // 以上「反射だけ滲ませる」ような演出パラメータは持たない。この強さだけが、
@@ -840,7 +856,7 @@ async function main() {
     uniformData[4] = turbidity;
     uniformData[5] = highlightIntensity;
     uniformData[6] = seaDepth;
-    uniformData[7] = 0;
+    uniformData[7] = renderDistance;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
     const encoder = device.createCommandEncoder();
