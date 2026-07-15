@@ -461,6 +461,39 @@ fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32, maxDist: f32) -> vec4
   return vec4<f32>(0.0, 0.0, 0.0, 0.0); // 探索範囲内で波面が見つからなかった
 }
 
+// 波の傾きが急だと、反射方向が上(空)ではなく下(水面へ戻る方向)を向くことがある
+// (最初はこれを検出してフォールバック色で塗るだけだったが、フレネル反射率が高い
+// 遠方でこの色がそのまま支配的になり、水深を変えても消えない黒っぽい斑になって
+// 目立つことが分かった)。shaders/ocean-gerstner.htmlと同じように、反射方向が
+// 下向きのままなら、その方向へさらにレイを飛ばして次の波面との交点を求め、
+// そこで反射方向を計算し直すことをMAX_REFLECTION_BOUNCES回まで繰り返す。
+// roughness=0の鏡面なので乱数は使わず、決定的に(intersectWater()を複数回呼ぶだけで)
+// 追跡できる。戻り値はxyz=最終的な反射方向, w=1.0(空に抜けた)/0.0(尽きても下向きのまま、
+// または途中でintersectWater()自体が交点を見つけられなかった)。
+const MAX_REFLECTION_BOUNCES: u32 = 3u;
+fn traceReflection(hitPos: vec3<f32>, normal: vec3<f32>, rayDir: vec3<f32>, time: f32, maxDist: f32) -> vec4<f32> {
+  var pos = hitPos;
+  var n = normal;
+  var dir = reflect(rayDir, n);
+
+  for (var i = 0u; i < MAX_REFLECTION_BOUNCES; i = i + 1u) {
+    if (dir.y >= 0.0) {
+      return vec4<f32>(dir, 1.0);
+    }
+    // 自己交差を避けるため法線方向へわずかにオフセットしてから次のレイを飛ばす
+    // (shaders/ocean-gerstner.htmlのtraceOceanReflection()と同じ手法)
+    let nextHit = intersectWater(pos + n * 0.01, dir, time, maxDist);
+    if (nextHit.w < 0.5) {
+      return vec4<f32>(dir, 0.0);
+    }
+    pos = nextHit.xyz;
+    n = gerstnerSample(pos.xz, time).normal;
+    dir = reflect(dir, n);
+  }
+
+  return vec4<f32>(dir, select(0.0, 1.0, dir.y >= 0.0));
+}
+
 // ---- 海底 ----
 fn hash21(p: vec2<f32>) -> f32 {
   var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
@@ -686,20 +719,18 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
         // 交点での波の法線。roughnessゼロの完全な鏡面なので、この1点の法線だけで
         // 反射・屈折・フレネルすべてが決まる(粗さによる乱数散乱は無い)。
         let normal = gerstnerSample(hitPos.xz, waveTime).normal;
-        let reflDir = reflect(rayDir, normal);
 
-        // 波の傾きが急だと、反射方向reflDirが上(空)ではなく下(水面へ戻る方向)を
-        // 向くことがある。本来ならshaders/ocean-gerstner.htmlのように反射方向を
-        // さらに追跡する(多重反射)べきだが、このシェーダーは1回の反射しか計算しない
-        // ため、そのままsampleSky(reflDir)すると空テクスチャの下半分(sky-precise.html
-        // では地面の暗い色が焼き込まれている領域)を誤ってサンプリングしてしまう。
-        // これも「フォールバック箇所を強調表示」で可視化できるようにする。
-        let reflValid = reflDir.y >= 0.0;
+        // 反射方向が下向きのままなら多重反射で空に抜けるまで追跡する(上のコメント参照)。
+        // それでも尽きた場合だけ「フォールバック箇所を強調表示」の対象にする。
+        let refl = traceReflection(hitPos, normal, rayDir, waveTime, renderDistance);
+        let reflDir = refl.xyz;
+        let reflValid = refl.w > 0.5;
         if (!reflValid && debugHighlight) {
           sampleColor = debugColor;
         } else {
-          // 多重反射を計算しない代わりのフォールバック色(水面が水面自身を映す、
-          // それらしい暗い水色。shaders/ocean-gerstner.htmlの同種のフォールバックと同じ考え方)
+          // 多重反射を使い切ってもなお下向きのままの場合のフォールバック色
+          // (水面が水面自身を映す、それらしい暗い水色。shaders/ocean-gerstner.htmlの
+          // 同種のフォールバックと同じ考え方)
           let sky = select(vec3<f32>(0.02, 0.05, 0.08), sampleSky(reflDir), reflValid);
           let disc = select(0.0, sunDisc(reflDir, sunDir, SUN_ANGULAR_RADIUS) * sunVisibilityOf(sunDir), reflValid);
 
