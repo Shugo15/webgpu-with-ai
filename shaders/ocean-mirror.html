@@ -377,21 +377,35 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
 // 近距離は細かく・遠距離は粗くステップすることで、波の見た目の精度を落とさずに
 // 描画距離を伸ばせるようにしている。戻り値はxyz=交差点の座標, w=見つかったら1.0/0.0。
 //
-// nearDist(5m)・nearStepはmaxDistと無関係な固定値なので、描画距離を伸ばしても
-// 手前(0〜5m)のステップ幅は変わらない。一方、遠距離側のステップ数を
-// ocean-gerstner.htmlと同じ固定24ステップのままにすると、farStep = farDist/24は
-// maxDistに比例して粗くなってしまう(maxDist=500mではfarStep≈20.6m、最大のうねり
-// (波長9m)より大きく、波を飛び越えて交点を見逃しうる)。描画距離を伸ばしても
-// 精度を落とさないよう、遠距離側もステップ幅がTARGET_FAR_STEP以下に収まる本数
+// 遠距離側のステップ数を固定にすると、farStep = farDist/本数は描画距離に比例して
+// 粗くなってしまう(波を飛び越えて交点を見逃しうる)。描画距離を伸ばしても精度を
+// 落とさないよう、遠距離側はステップ幅がTARGET_FAR_STEP以下に収まる本数
 // (最低8本)を動的に確保する。負荷は描画距離に比例して増えるが、それは許容する。
 const TARGET_FAR_STEP: f32 = 1.5; // 最も波長の短い「大きなうねり」(4.5m)の半分未満に抑える
+// 近距離側の範囲(nearDist)も、カメラの高さro.yにゆるく比例させる。固定値のままだと、
+// カメラを高くしたぶんだけ同じ画面位置のレイがy=0に届くまでのスラント距離が
+// (ほぼ比例して)伸びるため、精密な近距離域を素通りして粗い遠距離域まで探索する
+// レイが増える(実際にカメラの高さを2.5m→8.0mに上げた際、この理由でヘッドレス
+// 検証が大幅に遅くなった)。ただしnearStepsの本数は増やさない(増やすとその分
+// 全レイに一律でコストが乗ってしまう)ため、範囲を広げた分だけ1ステップの幅は
+// 少し粗くなるトレードオフを許容している。
+const NEAR_STEPS: u32 = 28u;
+// 波の振幅の合計より十分大きい安全マージン。レイの終点(t=maxDist)でもこの帯を
+// 上から見下ろせない(=数学的に絶対どの波面にも届かない)場合は、遠距離側を
+// 律儀に全ステップ探索してから「見つからなかった」と判定する前に早期に打ち切る。
+// カメラが高いほど、水平線に近い浅い角度のレイがこのケースに該当しやすく、
+// この早期打ち切りが無いと最も重いケース(全ステップ空振り)が激増してしまう。
+const WAVE_HEIGHT_MARGIN: f32 = 3.0;
 fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32, maxDist: f32) -> vec4<f32> {
   if (rd.y >= -0.0001) {
     return vec4<f32>(0.0, 0.0, 0.0, 0.0);
   }
+  if (ro.y + rd.y * maxDist > WAVE_HEIGHT_MARGIN) {
+    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+  }
 
-  let nearSteps = 28u;
-  let nearDist = 5.0;
+  let nearDist = max(ro.y * 2.0, 5.0);
+  let nearSteps = NEAR_STEPS;
   let nearStep = nearDist / f32(nearSteps);
 
   let farDist = max(maxDist - nearDist, 1.0);
@@ -616,8 +630,8 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let zenithMapped = min(pow(max(zenithLdr, vec3<f32>(0.0)), vec3<f32>(2.2)), vec3<f32>(0.98));
   let skyZenithLinear = zenithMapped / (vec3<f32>(1.0) - zenithMapped);
 
-  // 固定カメラ(水平方向を向く。shaders/ocean-gerstner.htmlと同じ配置)
-  let eye = vec3<f32>(0.0, 2.5, 0.0);
+  // 固定カメラ(水平方向を向く。高さのみshaders/ocean-gerstner.htmlより高くしてある)
+  let eye = vec3<f32>(0.0, 4.5, 0.0);
   let forward = vec3<f32>(0.0, 0.0, -1.0);
   let worldUp = vec3<f32>(0.0, 1.0, 0.0);
   let right = normalize(cross(forward, worldUp));
