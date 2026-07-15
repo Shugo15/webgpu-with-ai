@@ -136,11 +136,6 @@
     <span class="val" id="seaDepthVal">5.0m</span>
   </div>
   <div class="row">
-    <label for="highlightSharpness">ハイライトの鋭さ</label>
-    <input id="highlightSharpness" type="range" min="1" max="100" step="1" value="100">
-    <span class="val" id="highlightSharpnessVal">100</span>
-  </div>
-  <div class="row">
     <label for="highlightIntensity">ハイライトの強さ</label>
     <input id="highlightIntensity" type="range" min="0" max="500" step="10" value="100">
     <span class="val" id="highlightIntensityVal">100%</span>
@@ -180,7 +175,7 @@ const traceShaderCode = /* wgsl */ `
 ${vertexShaderCode}
 
 struct Uniforms {
-  resAndSun: vec4<f32>,   // xy = resolution, z = sunHour(太陽の時刻), w = ハイライト円盤の半径(ラジアン)
+  resAndSun: vec4<f32>,   // xy = resolution, z = sunHour(太陽の時刻), w = 未使用
   waterParams: vec4<f32>, // x = 濁り(0..1), y = ハイライト強度, z = 海の深さ(m), w = 未使用
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -404,12 +399,12 @@ fn waterRadiance(rayDir: vec3<f32>, sunDir: vec3<f32>, turbidity: f32, skyZenith
 // インポートPNGに太陽は含まれておらず、このシェーダーが太陽の時刻から解析的に描く。
 // 円盤はレイ方向(直視)または反射方向(水面)と太陽方向sunDirの「なす角」だけで決まる
 // (shaders/sky-precise.htmlの太陽円盤 smoothstep(cos(0.02), cos(0.009), dot(rayDir, sunDir))
-// と同じ考え方)。ただし半径・強さの扱いは直視と反射で分ける:
-// - 直視(空)の太陽は「実物」なので、実際の太陽の見かけの角半径(SUN_ANGULAR_RADIUS、
-//   sky-precise.htmlの円盤と同じ0.02ラジアン)と固定の強さで描き、スライダーの影響を受けない
-// - 反射(水面)のハイライトは「ハイライトの鋭さ/強さ」スライダーで演出的に調整できる
-//   (レンズのにじみに相当する広がりの表現)。最も鋭い設定にすると直視の太陽と
-//   ほぼ同じ大きさになり、完全な平面鏡としての鏡像に一致する
+// と同じ考え方)。水面はroughness=0の完全な平面鏡なので、直視・反射どちらも同じ
+// 実際の見かけの角半径(SUN_ANGULAR_RADIUS、sky-precise.htmlの円盤と同じ0.02ラジアン)を
+// 使う(反射だけ意図的に滲ませる物理的な根拠が無いため、両者で共通の定数にしている)。
+// 反射側は他の反射成分(sky*fresnel)と同様にフレネル反射率を掛け、「ハイライトの強さ」
+// スライダーだけを演出用の全体倍率として残している(0にすると反射側のハイライトだけを
+// 消せる。直視の太陽はスライダーの影響を受けない)。
 //
 // 【重要】最初はshaders/ocean-gerstner.htmlのsunGlitter()と同じBlinn-Phong方式
 // (視線と太陽方向のハーフベクトルhalfDir=normalize(view+sun)と法線の内積のべき乗)を
@@ -428,7 +423,8 @@ fn sunDisc(reflDir: vec3<f32>, sunDir: vec3<f32>, outerRadius: f32) -> f32 {
 }
 
 // 実際の太陽の見かけの角半径(sky-precise.htmlのSUN_ANGULAR_RADIUS_OUTERと同じ)。
-// 直視の太陽円盤はこの固定値で描く(ハイライトのスライダーは反射側だけに効く)
+// 直視・反射どちらの太陽円盤もこの固定値で描く(roughness=0の平面鏡には
+// 「反射だけ滲ませる」物理的な根拠が無いため)。
 const SUN_ANGULAR_RADIUS: f32 = 0.02;
 
 @fragment
@@ -436,7 +432,6 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let res = uniforms.resAndSun.xy;
   let sunHour = uniforms.resAndSun.z;
   let sunDir = hourToSunDir(sunHour);
-  let highlightRadius = uniforms.resAndSun.w;
   let turbidity = uniforms.waterParams.x;
   let highlightIntensity = uniforms.waterParams.y;
   let seaDepth = uniforms.waterParams.z;
@@ -471,7 +466,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     if (rayDir.y >= -0.0005) {
       // 水平線より上 = 空を直接見ている。インポートPNGは太陽円盤を含まないので、
       // 実際の太陽サイズの解析円盤をここで重ねる。これは「実物」なので、
-      // ハイライトの鋭さ/強さスライダー(反射の演出用)の影響は受けない
+      // ハイライトの強さスライダー(反射の演出用)の影響は受けない
       sampleColor = sampleSky(rayDir);
       let disc = sunDisc(rayDir, sunDir, SUN_ANGULAR_RADIUS) * sunVisibilityOf(sunDir);
       sampleColor += vec3<f32>(1.0, 0.98, 0.92) * disc;
@@ -497,8 +492,10 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
       let underwater = waterRadiance(rayDir, sunDir, turbidity, skyZenithLinear, seaDepth, surfaceXZ)
                      * (1.0 - fresnel) / (WATER_IOR * WATER_IOR);
       var waterColorResult = tonemapGamma(underwater) + sky * fresnel;
-      let disc = sunDisc(reflDir, sunDir, highlightRadius) * sunVisibilityOf(sunDir);
-      waterColorResult += vec3<f32>(1.0, 0.98, 0.92) * disc * highlightIntensity;
+      // 太陽のハイライトも他の反射成分と同じくフレネル反射率で重み付けする
+      // (反射である以上、視線角度に応じて2%〜100%に変化するのが物理的に正しい)
+      let disc = sunDisc(reflDir, sunDir, SUN_ANGULAR_RADIUS) * sunVisibilityOf(sunDir);
+      waterColorResult += vec3<f32>(1.0, 0.98, 0.92) * disc * fresnel * highlightIntensity;
       sampleColor = waterColorResult;
     }
     colorSum += sampleColor;
@@ -626,23 +623,11 @@ async function main() {
   });
   seaDepth = parseFloat(seaDepthInput.value);
 
-  // ハイライト円盤の半径(ラジアン)・強さ(倍率)。円盤の半径は反射方向と太陽方向の
-  // 「なす角」だけで決まる(shaders/sky-precise.htmlの太陽円盤と同じ考え方)ため、
-  // 視線角度によらず常に真円になる。鋭さのスライダーは対数的に半径へマッピングする
-  // (線形だとハイライトの見た目の変化が高い側に偏ってしまうため)。最も鋭い側は
-  // sky-precise.htmlの太陽円盤(外側半径0.02ラジアン)とほぼ同じ大きさにしてある。
-  let highlightRadius = 0.02;
+  // ハイライトの強さ(倍率)。円盤自体の半径はシェーダー側の物理定数
+  // (SUN_ANGULAR_RADIUS、実際の太陽の見かけの角半径)固定で、roughness=0の平面鏡である
+  // 以上「反射だけ滲ませる」ような演出パラメータは持たない。この強さだけが、
+  // 反射側のハイライトを直視の太陽から独立してオフ/減衰できる唯一のノブになっている。
   let highlightIntensity = 1.0;
-
-  const highlightSharpnessInput = document.getElementById('highlightSharpness');
-  const highlightSharpnessVal = document.getElementById('highlightSharpnessVal');
-  function updateHighlightSharpness() {
-    const t = parseInt(highlightSharpnessInput.value, 10) / 100;
-    highlightRadius = Math.pow(10, -1.7 + (1 - t) * 1.0); // 鋭さ100→0.02rad(実際の太陽円盤相当) 〜 鋭さ1→0.2rad(滲んだ光)
-    highlightSharpnessVal.textContent = String(highlightSharpnessInput.value);
-  }
-  highlightSharpnessInput.addEventListener('input', updateHighlightSharpness);
-  updateHighlightSharpness();
 
   const highlightIntensityInput = document.getElementById('highlightIntensity');
   const highlightIntensityVal = document.getElementById('highlightIntensityVal');
@@ -714,7 +699,7 @@ async function main() {
     uniformData[0] = canvas.width;
     uniformData[1] = canvas.height;
     uniformData[2] = sunHour;
-    uniformData[3] = highlightRadius;
+    uniformData[3] = 0;
     uniformData[4] = turbidity;
     uniformData[5] = highlightIntensity;
     uniformData[6] = seaDepth;
