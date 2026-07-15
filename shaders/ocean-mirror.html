@@ -142,8 +142,8 @@
   </div>
   <div class="row">
     <label for="highlightIntensity">ハイライトの強さ</label>
-    <input id="highlightIntensity" type="range" min="0" max="500" step="10" value="150">
-    <span class="val" id="highlightIntensityVal">150%</span>
+    <input id="highlightIntensity" type="range" min="0" max="500" step="10" value="100">
+    <span class="val" id="highlightIntensityVal">100%</span>
   </div>
 </div>
 <input id="importSkyFile" type="file" accept="image/png" style="display:none">
@@ -632,7 +632,7 @@ async function main() {
   // (線形だとハイライトの見た目の変化が高い側に偏ってしまうため)。最も鋭い側は
   // sky-precise.htmlの太陽円盤(外側半径0.02ラジアン)とほぼ同じ大きさにしてある。
   let highlightRadius = 0.05;
-  let highlightIntensity = 1.5;
+  let highlightIntensity = 1.0;
 
   const highlightSharpnessInput = document.getElementById('highlightSharpness');
   const highlightSharpnessVal = document.getElementById('highlightSharpnessVal');
