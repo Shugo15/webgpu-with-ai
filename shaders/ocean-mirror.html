@@ -339,6 +339,15 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
 // (shaders/ocean-gerstner.htmlのintersectWater()と同じアルゴリズム)。
 // 近距離は細かく・遠距離は粗くステップすることで、波の見た目の精度を落とさずに
 // 描画距離を伸ばせるようにしている。戻り値はxyz=交差点の座標, w=見つかったら1.0/0.0。
+//
+// nearDist(5m)・nearStepはmaxDistと無関係な固定値なので、描画距離を伸ばしても
+// 手前(0〜5m)のステップ幅は変わらない。一方、遠距離側のステップ数を
+// ocean-gerstner.htmlと同じ固定24ステップのままにすると、farStep = farDist/24は
+// maxDistに比例して粗くなってしまう(maxDist=500mではfarStep≈20.6m、最大のうねり
+// (波長9m)より大きく、波を飛び越えて交点を見逃しうる)。描画距離を伸ばしても
+// 精度を落とさないよう、遠距離側もステップ幅がTARGET_FAR_STEP以下に収まる本数
+// (最低8本)を動的に確保する。負荷は描画距離に比例して増えるが、それは許容する。
+const TARGET_FAR_STEP: f32 = 1.5; // 最も波長の短い「大きなうねり」(4.5m)の半分未満に抑える
 fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32, maxDist: f32) -> vec4<f32> {
   if (rd.y >= -0.0001) {
     return vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -348,8 +357,8 @@ fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32, maxDist: f32) -> vec4
   let nearDist = 5.0;
   let nearStep = nearDist / f32(nearSteps);
 
-  let farSteps = 24u;
   let farDist = max(maxDist - nearDist, 1.0);
+  let farSteps = max(u32(ceil(farDist / TARGET_FAR_STEP)), 8u);
   let farStep = farDist / f32(farSteps);
 
   let steps = nearSteps + farSteps;
