@@ -686,30 +686,43 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
         // 交点での波の法線。roughnessゼロの完全な鏡面なので、この1点の法線だけで
         // 反射・屈折・フレネルすべてが決まる(粗さによる乱数散乱は無い)。
         let normal = gerstnerSample(hitPos.xz, waveTime).normal;
-
         let reflDir = reflect(rayDir, normal);
-        let sky = sampleSky(reflDir);
 
-        // Fresnel(厳密な式。屈折角はSnellの法則から内部で求める):
-        // dot(視線, 法線) = dot(-rayDir, normal)
-        let cosTheta = max(dot(-rayDir, normal), 0.0);
-        let fresnel = exactFresnel(cosTheta, 1.0, WATER_IOR);
+        // 波の傾きが急だと、反射方向reflDirが上(空)ではなく下(水面へ戻る方向)を
+        // 向くことがある。本来ならshaders/ocean-gerstner.htmlのように反射方向を
+        // さらに追跡する(多重反射)べきだが、このシェーダーは1回の反射しか計算しない
+        // ため、そのままsampleSky(reflDir)すると空テクスチャの下半分(sky-precise.html
+        // では地面の暗い色が焼き込まれている領域)を誤ってサンプリングしてしまう。
+        // これも「フォールバック箇所を強調表示」で可視化できるようにする。
+        let reflValid = reflDir.y >= 0.0;
+        if (!reflValid && debugHighlight) {
+          sampleColor = debugColor;
+        } else {
+          // 多重反射を計算しない代わりのフォールバック色(水面が水面自身を映す、
+          // それらしい暗い水色。shaders/ocean-gerstner.htmlの同種のフォールバックと同じ考え方)
+          let sky = select(vec3<f32>(0.02, 0.05, 0.08), sampleSky(reflDir), reflValid);
+          let disc = select(0.0, sunDisc(reflDir, sunDir, SUN_ANGULAR_RADIUS) * sunVisibilityOf(sunDir), reflValid);
 
-        // 局所的な海の深さ = 指定した深さ + 交点の高さ(波の頂上ではその分深く、
-        // 谷ではその分浅くなる。海底自体はワールド空間で波と無関係に平らなまま)
-        let localDepth = max(seaDepth + hitPos.y, 0.05);
+          // Fresnel(厳密な式。屈折角はSnellの法則から内部で求める):
+          // dot(視線, 法線) = dot(-rayDir, normal)
+          let cosTheta = max(dot(-rayDir, normal), 0.0);
+          let fresnel = exactFresnel(cosTheta, 1.0, WATER_IOR);
 
-        // 海中の単散乱+海底(線形HDR)。水中から空気へ出るときのフレネル透過(1-F)と、
-        // 屈折率n^2による放射輝度の圧縮(水中の輝度は空気側でL/n^2になる)を線形側で
-        // 掛けてから、焼き込みと同じトーンカーブで表示空間へ変換する
-        let underwater = waterRadiance(rayDir, sunDir, turbidity, skyZenithLinear, localDepth, hitPos.xz, normal)
-                       * (1.0 - fresnel) / (WATER_IOR * WATER_IOR);
-        var waterColorResult = tonemapGamma(underwater) + sky * fresnel;
-        // 太陽のハイライトも他の反射成分と同じくフレネル反射率で重み付けする
-        // (反射である以上、視線角度に応じて2%〜100%に変化するのが物理的に正しい)
-        let disc = sunDisc(reflDir, sunDir, SUN_ANGULAR_RADIUS) * sunVisibilityOf(sunDir);
-        waterColorResult += vec3<f32>(1.0, 0.98, 0.92) * disc * fresnel * highlightIntensity;
-        sampleColor = waterColorResult;
+          // 局所的な海の深さ = 指定した深さ + 交点の高さ(波の頂上ではその分深く、
+          // 谷ではその分浅くなる。海底自体はワールド空間で波と無関係に平らなまま)
+          let localDepth = max(seaDepth + hitPos.y, 0.05);
+
+          // 海中の単散乱+海底(線形HDR)。水中から空気へ出るときのフレネル透過(1-F)と、
+          // 屈折率n^2による放射輝度の圧縮(水中の輝度は空気側でL/n^2になる)を線形側で
+          // 掛けてから、焼き込みと同じトーンカーブで表示空間へ変換する
+          let underwater = waterRadiance(rayDir, sunDir, turbidity, skyZenithLinear, localDepth, hitPos.xz, normal)
+                         * (1.0 - fresnel) / (WATER_IOR * WATER_IOR);
+          var waterColorResult = tonemapGamma(underwater) + sky * fresnel;
+          // 太陽のハイライトも他の反射成分と同じくフレネル反射率で重み付けする
+          // (反射である以上、視線角度に応じて2%〜100%に変化するのが物理的に正しい)
+          waterColorResult += vec3<f32>(1.0, 0.98, 0.92) * disc * fresnel * highlightIntensity;
+          sampleColor = waterColorResult;
+        }
       }
     }
     colorSum += sampleColor;
