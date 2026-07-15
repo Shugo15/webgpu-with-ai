@@ -131,6 +131,11 @@
     <span class="val" id="turbidityVal">10%</span>
   </div>
   <div class="row">
+    <label for="seaDepth">海の深さ</label>
+    <input id="seaDepth" type="range" min="0.5" max="50" step="0.5" value="5">
+    <span class="val" id="seaDepthVal">5.0m</span>
+  </div>
+  <div class="row">
     <label for="highlightSharpness">ハイライトの鋭さ</label>
     <input id="highlightSharpness" type="range" min="1" max="100" step="1" value="60">
     <span class="val" id="highlightSharpnessVal">60</span>
@@ -164,17 +169,19 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f
 // ガーストナー波(shaders/ocean-gerstner.html)のような高さフィールドの探索・粗さによる
 // 表面散乱・白波は持たないが、太陽方向への明示的なハイライト(sunDisc())と、
 // 水面下の海中の単散乱(waterRadiance()。吸収・散乱係数から閉形式で厳密に積分する。
-// 水の色はハードコードせず、純水の吸収の波長依存から自然に青が出る)を計算する。
+// 水の色はハードコードせず、純水の吸収の波長依存から自然に青が出る)と、
+// 指定した深さにある平らな海底(プロシージャルな砂地の模様、Lambertian反射)を計算する。
 // 無限に平らな鏡面なので反射方向は視線方向だけで決まり(法線が(0,1,0)で一定なため、
-// 水面上のどの位置で反射しても結果は同じ)、交差点の座標自体は計算に使わない。
-// 海中の閉形式積分も乱数を使わない決定的な計算なので、蓄積(時間積分)は不要で、
+// 水面上のどの位置で反射しても結果は同じ)、空の反射には交差点の座標を使わないが、
+// 海底の模様の位置決めには水面への入射点+屈折方向から求めた海底の座標を使う。
+// 海中の閉形式積分も海底も乱数を使わない決定的な計算なので、蓄積(時間積分)は不要で、
 // フレームごとに再計算するだけのリアルタイム描画になっている。
 const traceShaderCode = /* wgsl */ `
 ${vertexShaderCode}
 
 struct Uniforms {
   resAndSun: vec4<f32>,   // xy = resolution, z = sunHour(太陽の時刻), w = ハイライト円盤の半径(ラジアン)
-  waterParams: vec4<f32>, // x = 濁り(0..1), y = ハイライト強度, zw = 未使用
+  waterParams: vec4<f32>, // x = 濁り(0..1), y = ハイライト強度, z = 海の深さ(m), w = 未使用
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var envTex: texture_2d<f32>;
@@ -259,20 +266,79 @@ fn schlickFresnel(cosTheta: f32) -> f32 {
   return f0 + (1.0 - f0) * pow(1.0 - max(cosTheta, 0.0), 5.0);
 }
 
+// ---- 海底 ----
+fn hash21(p: vec2<f32>) -> f32 {
+  var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+  p3 = p3 + dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+// 格子点のハッシュ値を滑らかに補間する2Dバリューノイズ(0..1)
+fn valueNoise(p: vec2<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = hash21(i);
+  let b = hash21(i + vec2<f32>(1.0, 0.0));
+  let c = hash21(i + vec2<f32>(0.0, 1.0));
+  let d = hash21(i + vec2<f32>(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// 海底(平面)のアルベド。プロシージャルな砂地の模様:
+// - 砂紋(波と直交方向に走る縞。位相を低周波ノイズで揺らして自然にうねらせる)
+// - 低周波ノイズによる暗い斑(海草・岩場のつもり)
+// - 細かい粒感
+// distはカメラから海底までの水中経路長。遠方では模様の周波数が画素間隔を超えて
+// モアレ(エイリアシング)になるため、距離に応じて模様を平均色へフェードさせる
+// (ocean-gerstner.htmlの白波の距離フェードと同じ考え方)。
+fn seafloorAlbedo(p: vec2<f32>, dist: f32) -> vec3<f32> {
+  let sand = vec3<f32>(0.42, 0.38, 0.30);
+  let dark = vec3<f32>(0.10, 0.13, 0.09);
+
+  // 砂紋: 波長約0.8mの縞。valueNoiseで位相を±3ラジアン程度揺らす
+  let rippleDir = normalize(vec2<f32>(1.0, 0.35));
+  let wobble = (valueNoise(p * 0.35) - 0.5) * 6.0;
+  let ripple = sin(dot(p, rippleDir) * 8.0 + wobble);
+  let rippleShade = 0.85 + 0.15 * ripple;
+
+  // 細かい粒感(最も高周波なので最も速くフェードさせる)
+  let grain = 0.9 + 0.2 * hash21(floor(p * 24.0));
+  let grainFade = 1.0 - smoothstep(4.0, 12.0, dist);
+  let grainShade = mix(1.0, grain, grainFade);
+
+  // 砂紋のフェード(粒感より低周波なので少し遠くまで残す)
+  let rippleFade = 1.0 - smoothstep(10.0, 40.0, dist);
+  let rippleShadeFaded = mix(1.0, rippleShade, rippleFade);
+
+  var albedo = sand * rippleShadeFaded * grainShade;
+
+  // 暗い斑: 低周波なので最後までフェードさせない(遠方でも見える大きさ)
+  // (変数名: "patch"はWGSLの予約語なので使えない。"target"と同じ落とし穴)
+  let darkPatch = smoothstep(0.55, 0.75, valueNoise(p * 0.15));
+  albedo = mix(albedo, dark, darkPatch * 0.85);
+  return albedo;
+}
+
 // 水面下の単散乱を閉形式で厳密に積分した、水中から水面へ向かう上向き放射輝度(線形HDR)。
 //
-// モデル: 水は均質で無限に深い。太陽の平行光が水面で屈折して差し込み(フレネル透過)、
-// 屈折した視線の経路上の各点で1回散乱して眼に届く。経路上の距離sの点は
-// 深さ z = s*dy (dy = 屈折視線の下向き成分)にあり、そこへ届く太陽光の水中経路長は
-// z/sy (sy = 屈折太陽光の下向き成分)。消散係数c(吸収+散乱)による減衰を両経路に掛けると
-//   L = Σ_i b_i P_i(θ) E_uw ∫[0,∞) exp(-c s) exp(-c s dy/sy) ds
-//     = Σ_i b_i P_i(θ) E_uw / (c (1 + dy/sy))
+// モデル: 水は均質で、深さdepth(m)に平らな海底がある。太陽の平行光が水面で屈折して
+// 差し込み(フレネル透過)、屈折した視線の経路上の各点で1回散乱して眼に届く。
+// 経路上の距離sの点は深さ z = s*dy (dy = 屈折視線の下向き成分)にあり、そこへ届く
+// 太陽光の水中経路長は z/sy (sy = 屈折太陽光の下向き成分)。消散係数c(吸収+散乱)による
+// 減衰を両経路に掛け、海底までの経路長 sMax = depth/dy で積分を打ち切ると
+//   L = Σ_i b_i P_i(θ) E_uw ∫[0,sMax] exp(-c s) exp(-c s dy/sy) ds
+//     = Σ_i b_i P_i(θ) E_uw (1 - exp(-c (1 + dy/sy) sMax)) / (c (1 + dy/sy))
 // と解析的に積分できる(iは分子散乱/粒子散乱。係数b_iと位相関数P_iが異なる)。
-// レイマーチも乱数も不要な決定的計算なので、このシェーダーの1パス構成のまま使える。
+// depthを大きくするとexp項が消えて元の無限深度の式に滑らかに収束する。
+// これに海底(Lambertian)の寄与
+//   L_floor = albedo/π × (海底に届く照度) × exp(-c sMax)   (往路=太陽光の下り、復路=視線の上り)
+// を加える。レイマーチも乱数も不要な決定的計算なので、このシェーダーの1パス構成のまま使える。
 //
 // 既知の簡略化: 多重散乱は含まない(散乱アルベドb/cが大きい濁った水ほど過小評価)。
-// 太陽光の大気透過(夕方の赤み)はsunVisibilityOfの減光のみで近似。海底・浮遊物は無い。
-fn waterRadiance(rayDir: vec3<f32>, sunDir: vec3<f32>, turbidity: f32, skyZenithLinear: vec3<f32>) -> vec3<f32> {
+// 太陽光の大気透過(夕方の赤み)はsunVisibilityOfの減光のみで近似。
+// 海底に落ちる波の集光模様(コースティクス)は水面が完全平面なので原理的に生じない。
+fn waterRadiance(rayDir: vec3<f32>, sunDir: vec3<f32>, turbidity: f32, skyZenithLinear: vec3<f32>, depth: f32, surfaceXZ: vec2<f32>) -> vec3<f32> {
   let up = vec3<f32>(0.0, 1.0, 0.0);
   // 空気->水の屈折。視線(下向き)と、太陽光の進行方向(-sunDir)の両方
   let viewW = refract(rayDir, up, 1.0 / WATER_IOR);
@@ -284,13 +350,17 @@ fn waterRadiance(rayDir: vec3<f32>, sunDir: vec3<f32>, turbidity: f32, skyZenith
   let bPart = PARTICLE_SCATTER_MAX * turbidity;
   let extinction = WATER_ABSORPTION + PARTICLE_ABSORPTION_MAX * turbidity + bMol + bPart;
 
+  // 屈折した視線が海底に届くまでの水中経路長
+  let sMax = depth / dy;
+
   // 散乱角: 水中を進む太陽光(sunW)から、眼へ向かう方向(-viewW)への散乱
   let cosTheta = dot(sunW, -viewW);
   // 水面直下の太陽照度(ビームに垂直な面での照度。sky-preciseのNEEと同じ規約)。
   // 水面のフレネル透過(1-F)を掛け、夜はsunVisibilityOfで消灯する
   let eUnderwater = vec3<f32>(1.0, 0.98, 0.92) * SUN_INTENSITY * sunVisibilityOf(sunDir)
                   * (1.0 - schlickFresnel(max(sunDir.y, 0.0)));
-  let pathFactor = 1.0 / (extinction * (1.0 + dy / sy));
+  let kSun = extinction * (1.0 + dy / sy);
+  let pathFactor = (1.0 - exp(-kSun * sMax)) / kSun;
   // 粒子の位相関数は強い前方散乱(Petzold測定の代表値 g≈0.924 のHenyey-Greenstein)
   var radiance = (bMol * rayleighPhase(cosTheta) + bPart * hgPhase(cosTheta, 0.924)) * eUnderwater * pathFactor;
 
@@ -298,7 +368,19 @@ fn waterRadiance(rayDir: vec3<f32>, sunDir: vec3<f32>, turbidity: f32, skyZenith
   // 半球一様な入射(照度 = π * 輝度)とみなし、等方位相 1/(4π)・拡散光の平均斜入射による
   // 経路の伸び(係数2)で直達光と同じ閉形式を流用する。厳密な積分ではないが、
   // 直達光が弱い朝夕や日陰側で水が不自然な真っ黒になるのを防ぐ
-  radiance += skyZenithLinear * PI * (bMol + bPart) * (1.0 / (4.0 * PI)) / (extinction * (1.0 + 2.0 * dy));
+  let kSky = extinction * (1.0 + 2.0 * dy);
+  radiance += skyZenithLinear * PI * (bMol + bPart) * (1.0 / (4.0 * PI)) * (1.0 - exp(-kSky * sMax)) / kSky;
+
+  // 海底(平面、Lambertian)の寄与。
+  // 海底に届く照度 = 直達光(水平な床への入射なのでcos = sy を掛け、深さ/syの経路で減衰)
+  //              + 天空光(半球拡散の平均斜入射として経路2×depthで減衰)
+  // それをアルベド/πで等方に反射し、視線経路sMaxぶんの減衰を掛けて眼に届く。
+  // 模様の座標は屈折した視線が実際に海底へ達する位置(水面の入射点 + viewW.xz * sMax)。
+  let floorXZ = surfaceXZ + viewW.xz * sMax;
+  let albedo = seafloorAlbedo(floorXZ, sMax);
+  let eFloor = eUnderwater * sy * exp(-extinction * (depth / sy))
+             + skyZenithLinear * PI * exp(-extinction * 2.0 * depth);
+  radiance += albedo / PI * eFloor * exp(-extinction * sMax);
 
   return radiance;
 }
@@ -344,6 +426,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let highlightRadius = uniforms.resAndSun.w;
   let turbidity = uniforms.waterParams.x;
   let highlightIntensity = uniforms.waterParams.y;
+  let seaDepth = uniforms.waterParams.z;
 
   // 天空光の代表値としてインポートした空の天頂輝度を1回サンプリングし、LDR(トーンマップ済み)
   // から逆Reinhard(ガンマ2.2 -> m/(1-m)、飽和対策で0.98にクランプ)で概算の線形HDRへ戻す。
@@ -389,10 +472,15 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
       let cosTheta = max(-rayDir.y, 0.0);
       let fresnel = schlickFresnel(cosTheta);
 
-      // 海中の単散乱(線形HDR)。水中から空気へ出るときのフレネル透過(1-F)と、
+      // 視線が水面(y=0)に入射する点。海底の模様の位置決めに使う
+      // (この分岐はrayDir.y < -0.0005が保証されているのでゼロ除算しない)
+      let tSurf = -eye.y / rayDir.y;
+      let surfaceXZ = eye.xz + rayDir.xz * tSurf;
+
+      // 海中の単散乱+海底(線形HDR)。水中から空気へ出るときのフレネル透過(1-F)と、
       // 屈折率n^2による放射輝度の圧縮(水中の輝度は空気側でL/n^2になる)を線形側で
       // 掛けてから、焼き込みと同じトーンカーブで表示空間へ変換する
-      let underwater = waterRadiance(rayDir, sunDir, turbidity, skyZenithLinear)
+      let underwater = waterRadiance(rayDir, sunDir, turbidity, skyZenithLinear, seaDepth, surfaceXZ)
                      * (1.0 - fresnel) / (WATER_IOR * WATER_IOR);
       var waterColorResult = tonemapGamma(underwater) + sky * fresnel;
       let disc = sunDisc(reflDir, sunDir, highlightRadius) * sunVisibilityOf(sunDir);
@@ -513,6 +601,17 @@ async function main() {
   });
   turbidity = parseInt(turbidityInput.value, 10) / 100;
 
+  // 海の深さ(m)。屈折した視線がこの深さの平面(海底)に届いたところで散乱の積分を
+  // 打ち切り、海底からの反射光を加える。深くするほど無限深度の見た目に収束する
+  let seaDepth = 5.0;
+  const seaDepthInput = document.getElementById('seaDepth');
+  const seaDepthVal = document.getElementById('seaDepthVal');
+  seaDepthInput.addEventListener('input', () => {
+    seaDepth = parseFloat(seaDepthInput.value);
+    seaDepthVal.textContent = seaDepth.toFixed(1) + 'm';
+  });
+  seaDepth = parseFloat(seaDepthInput.value);
+
   // ハイライト円盤の半径(ラジアン)・強さ(倍率)。円盤の半径は反射方向と太陽方向の
   // 「なす角」だけで決まる(shaders/sky-precise.htmlの太陽円盤と同じ考え方)ため、
   // 視線角度によらず常に真円になる。鋭さのスライダーは対数的に半径へマッピングする
@@ -604,7 +703,7 @@ async function main() {
     uniformData[3] = highlightRadius;
     uniformData[4] = turbidity;
     uniformData[5] = highlightIntensity;
-    uniformData[6] = 0;
+    uniformData[6] = seaDepth;
     uniformData[7] = 0;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
