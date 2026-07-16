@@ -327,8 +327,18 @@ const WAVE_STEEPNESS: f32 = 0.032; // 各波の傾き(振幅/波長)の目安
 const WAVE_CHOPPINESS: f32 = 1.1;  // トロコイドが尖りすぎない(自己交差しない)ように抑える全体の急峻さ
 const WIND_DIR = vec2<f32>(0.9435, 0.3313); // normalize(vec2(1.0, 0.35))。海底の砂紋と同じ向き
 
+// 太陽照明用の低周波法線(normalSun)に含める最小波長(m)。
+// waterRadiance()の水柱・海底に差し込む太陽光は、視線の入射点とは別の広い水面から
+// 入ってくるため、その透過率を視線入射点の微視的ファセット1枚の法線でゲートするのは
+// 物理的に誤り(太陽が低いとき dot(sunDir, normal)≦0 のファセットで透過が二値的に
+// 0へ落ち、水柱と海底が同時に真っ黒になる。点サンプリングがそれを硬い黒点の網に
+// エイリアスする、というアーティファクトが実際に出た)。うねりスケールの波だけで
+// 作った低周波法線なら太陽高度27°でも入射角は最大~74°に留まり、透過率は滑らかに変化する。
+const SUN_NORMAL_MIN_WAVELENGTH: f32 = 1.0;
+
 struct WaveSample {
-  normal: vec3<f32>,
+  normal: vec3<f32>,    // 局所法線(微細波まで含む)。鏡面反射・視線の屈折・視線側フレネル用
+  normalSun: vec3<f32>, // 低周波法線(波長SUN_NORMAL_MIN_WAVELENGTH以上のみ)。太陽照明の透過・屈折用
   height: f32,
 };
 
@@ -345,6 +355,9 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
   var sumDz = 0.0;
   var sumY = 0.0;
   var height = 0.0;
+  var sumDxSun = 0.0;
+  var sumDzSun = 0.0;
+  var sumYSun = 0.0;
 
   for (var i = 0u; i < NUM_WAVES; i = i + 1u) {
     let t = f32(i) / f32(NUM_WAVES - 1u); // 0(最大の波長)..1(最小の波長)
@@ -370,14 +383,24 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
     let c = cos(theta);
     let s = sin(theta);
 
-    sumDx += dir.x * k * amp * c;
-    sumDz += dir.y * k * amp * c;
-    sumY += q * k * amp * s;
+    let dxContrib = dir.x * k * amp * c;
+    let dzContrib = dir.y * k * amp * c;
+    let yContrib = q * k * amp * s;
+    sumDx += dxContrib;
+    sumDz += dzContrib;
+    sumY += yContrib;
     height += amp * s;
+    // うねりスケールの波だけを太陽照明用の低周波法線にも積む
+    if (baseLength >= SUN_NORMAL_MIN_WAVELENGTH) {
+      sumDxSun += dxContrib;
+      sumDzSun += dzContrib;
+      sumYSun += yContrib;
+    }
   }
 
   let normal = normalize(vec3<f32>(-sumDx, 1.0 - sumY, -sumDz));
-  return WaveSample(normal, height);
+  let normalSun = normalize(vec3<f32>(-sumDxSun, 1.0 - sumYSun, -sumDzSun));
+  return WaveSample(normal, normalSun, height);
 }
 
 
@@ -567,16 +590,24 @@ fn seafloorAlbedo(p: vec2<f32>, dist: f32) -> vec3<f32> {
 // (水面と波面の交点を求める部分だけはintersectWater()でレイマーチングするが、そちらも
 // 乱数を使わない決定的な二分探索なので蓄積は不要)。
 //
+// 法線の使い分け: 視線側(viewWの屈折)は視線が実際に交差した1点の局所法線normalを使う
+// (波による海底模様の歪み、というこのシェーダーの目的そのもの)。一方、太陽光の入射側
+// (透過フレネルとsunWの屈折)は低周波法線normalSunを使う。水柱の各散乱点や海底に届く
+// 太陽光は視線の入射点とは別の広い水面から入ってくるので、その透過率は入射点の微視的
+// ファセット1枚ではなく水面の大づかみな傾き(うねり)で決まる。局所法線を使うと、
+// 太陽が低いときに太陽から背いたファセットで透過が0に落ち、水柱+海底が同時に消えて
+// 「黒い網点」のエイリアシングになる(実際に出たアーティファクト。WaveSampleのコメント参照)。
+//
 // 既知の簡略化: 多重散乱は含まない(散乱アルベドb/cが大きい濁った水ほど過小評価)。
 // 太陽光の大気透過(夕方の赤み)はsunVisibilityOfの減光のみで近似。
 // 海底に落ちる波の集光模様(コースティクス。波面の曲率による屈折光の集中)は、
 // 単散乱を波ごとの局所法線1つだけで代表させる近似のため再現していない
 // (真の集光には隣接する波面の法線の収束・発散を追う必要がある)。
-fn waterRadiance(rayDir: vec3<f32>, sunDir: vec3<f32>, turbidity: f32, skyZenithLinear: vec3<f32>, depth: f32, surfaceXZ: vec2<f32>, normal: vec3<f32>) -> vec3<f32> {
-  // 空気->水の屈折。視線(下向き)と、太陽光の進行方向(-sunDir)の両方。
-  // 波で傾いた局所法線normalを使う(平面だった頃の固定up=(0,1,0)の一般化)。
+fn waterRadiance(rayDir: vec3<f32>, sunDir: vec3<f32>, turbidity: f32, skyZenithLinear: vec3<f32>, depth: f32, surfaceXZ: vec2<f32>, normal: vec3<f32>, normalSun: vec3<f32>) -> vec3<f32> {
+  // 空気->水の屈折。視線(下向き)は局所法線、太陽光の進行方向(-sunDir)は低周波法線
+  // (上のコメント参照)。
   let viewW = refract(rayDir, normal, 1.0 / WATER_IOR);
-  let sunW = refract(-sunDir, normal, 1.0 / WATER_IOR);
+  let sunW = refract(-sunDir, normalSun, 1.0 / WATER_IOR);
   let dy = max(-viewW.y, 1e-3);
   let sy = max(-sunW.y, 1e-3);
 
@@ -590,10 +621,10 @@ fn waterRadiance(rayDir: vec3<f32>, sunDir: vec3<f32>, turbidity: f32, skyZenith
   // 散乱角: 水中を進む太陽光(sunW)から、眼へ向かう方向(-viewW)への散乱
   let cosTheta = dot(sunW, -viewW);
   // 水面直下の太陽照度(ビームに垂直な面での照度。sky-preciseのNEEと同じ規約)。
-  // 水面のフレネル透過(1-F。太陽方向と局所法線のなす角を使う)を掛け、
+  // 水面のフレネル透過(1-F。太陽方向と低周波法線のなす角を使う)を掛け、
   // 夜はsunVisibilityOfで消灯する
   let eUnderwater = vec3<f32>(1.0, 0.98, 0.92) * SUN_INTENSITY * sunVisibilityOf(sunDir)
-                  * (1.0 - exactFresnel(max(dot(sunDir, normal), 0.0), 1.0, WATER_IOR));
+                  * (1.0 - exactFresnel(max(dot(sunDir, normalSun), 0.0), 1.0, WATER_IOR));
   let kSun = extinction * (1.0 + dy / sy);
   let pathFactor = (1.0 - exp(-kSun * sMax)) / kSun;
   // 粒子の位相関数は強い前方散乱(Petzold測定の代表値 g≈0.924 のHenyey-Greenstein)
@@ -716,9 +747,11 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
         }
       } else {
         let hitPos = hit.xyz;
-        // 交点での波の法線。roughnessゼロの完全な鏡面なので、この1点の法線だけで
-        // 反射・屈折・フレネルすべてが決まる(粗さによる乱数散乱は無い)。
-        let normal = gerstnerSample(hitPos.xz, waveTime).normal;
+        // 交点での波の法線。roughnessゼロの完全な鏡面なので、視線側(反射・屈折・
+        // 視線のフレネル)はこの1点の局所法線だけで決まる(粗さによる乱数散乱は無い)。
+        // 太陽照明側だけは低周波法線normalSunを使う(waterRadiance()のコメント参照)。
+        let waveSample = gerstnerSample(hitPos.xz, waveTime);
+        let normal = waveSample.normal;
 
         // 反射方向が下向きのままなら多重反射で空に抜けるまで追跡する(上のコメント参照)。
         // それでも尽きた場合だけ「フォールバック箇所を強調表示」の対象にする。
@@ -746,7 +779,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
           // 海中の単散乱+海底(線形HDR)。水中から空気へ出るときのフレネル透過(1-F)と、
           // 屈折率n^2による放射輝度の圧縮(水中の輝度は空気側でL/n^2になる)を線形側で
           // 掛けてから、焼き込みと同じトーンカーブで表示空間へ変換する
-          let underwater = waterRadiance(rayDir, sunDir, turbidity, skyZenithLinear, localDepth, hitPos.xz, normal)
+          let underwater = waterRadiance(rayDir, sunDir, turbidity, skyZenithLinear, localDepth, hitPos.xz, normal, waveSample.normalSun)
                          * (1.0 - fresnel) / (WATER_IOR * WATER_IOR);
           var waterColorResult = tonemapGamma(underwater) + sky * fresnel;
           // 太陽のハイライトも他の反射成分と同じくフレネル反射率で重み付けする
