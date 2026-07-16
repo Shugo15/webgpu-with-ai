@@ -327,6 +327,22 @@ const WAVE_STEEPNESS: f32 = 0.032; // 各波の傾き(振幅/波長)の目安
 const WAVE_CHOPPINESS: f32 = 1.1;  // トロコイドが尖りすぎない(自己交差しない)ように抑える全体の急峻さ
 const WIND_DIR = vec2<f32>(0.9435, 0.3313); // normalize(vec2(1.0, 0.35))。海底の砂紋と同じ向き
 
+// ---- 波のLOD(距離による微細波のフェードアウト) ----
+// 最小4cmの微細波は、少し離れるとピクセルフットプリント(1画素が水面上で覆う範囲。
+// カメラ高さ4.5m・fov1.5では地面方向におよそ (距離^2)×4×10^-4 m まで伸びる)より
+// 小さくなり、点サンプリングが波の山・谷を画素ごとに疑似ランダムに拾うエイリアシング
+// になる。実カメラなら1画素はフットプリント内の無数のファセットの「平均」を記録する
+// ので、平均化の代わりに「解像できなくなった波長の波を振幅ごと消す」ことで滑らかな
+// 極限に近づける。波長λの波が画素で解像できる限界距離はナイキスト条件
+// footprint < λ/2 から 距離 ≈ 34√λ (2x2サブサンプルで実効2倍 → ≈48√λ)。
+// フェード完了をその手前の45√λに置く。うねり(6m)は 110m 以遠、微細波(4cm)は 9m
+// 以遠で消え、遠方の海面は滑らかなうねりだけ(水平線際はほぼ平面鏡)に収束する。
+// これは「遠方の未解像の微細構造は平均されて見えない」という実写の見え方と一致する。
+// 高さと法線の両方に同じフェードを掛け、高さフィールドとして一貫させる
+// (フェードの空間スケール≫波長なので、振幅の空間微分の無視は法線に影響しない)。
+const WAVE_LOD_FADE_END: f32 = 45.0;   // フェード完了距離 = この係数 × √波長
+const WAVE_LOD_FADE_START: f32 = 18.0; // フェード開始距離 = この係数 × √波長
+
 // 太陽照明用の低周波法線(normalSun)に含める最小波長(m)。
 // waterRadiance()の水柱・海底に差し込む太陽光は、視線の入射点とは別の広い水面から
 // 入ってくるため、その透過率を視線入射点の微視的ファセット1枚の法線でゲートするのは
@@ -350,6 +366,8 @@ fn waveHash(i: u32, salt: f32) -> f32 {
 
 fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
   let windAngle = atan2(WIND_DIR.y, WIND_DIR.x);
+  // 波のLODに使うカメラからの水平距離(カメラはXZ原点に固定されている)
+  let camDist = length(pos);
 
   var sumDx = 0.0;
   var sumDz = 0.0;
@@ -383,13 +401,17 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
     let c = cos(theta);
     let s = sin(theta);
 
-    let dxContrib = dir.x * k * amp * c;
-    let dzContrib = dir.y * k * amp * c;
-    let yContrib = q * k * amp * s;
+    // LOD: 画素で解像できなくなる距離でこの波をフェードアウト(上のコメント参照)
+    let sqrtLen = sqrt(wavelength);
+    let lodFade = 1.0 - smoothstep(WAVE_LOD_FADE_START * sqrtLen, WAVE_LOD_FADE_END * sqrtLen, camDist);
+
+    let dxContrib = dir.x * k * amp * c * lodFade;
+    let dzContrib = dir.y * k * amp * c * lodFade;
+    let yContrib = q * k * amp * s * lodFade;
     sumDx += dxContrib;
     sumDz += dzContrib;
     sumY += yContrib;
-    height += amp * s;
+    height += amp * s * lodFade;
     // うねりスケールの波だけを太陽照明用の低周波法線にも積む
     if (baseLength >= SUN_NORMAL_MIN_WAVELENGTH) {
       sumDxSun += dxContrib;
