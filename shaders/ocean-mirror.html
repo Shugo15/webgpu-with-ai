@@ -177,8 +177,8 @@
     </div>
     <div class="row">
       <label for="highlightIntensity">ハイライトの強さ</label>
-      <input id="highlightIntensity" type="range" min="0" max="500" step="10" value="100">
-      <span class="val" id="highlightIntensityVal">100%</span>
+      <input id="highlightIntensity" type="range" min="0" max="500" step="10" value="10">
+      <span class="val" id="highlightIntensityVal">10%</span>
     </div>
     <div class="row">
       <label for="debugHighlight">フォールバック箇所を強調表示</label>
@@ -804,10 +804,29 @@ const SUN_ANGULAR_RADIUS: f32 = 0.02;
 // レイトレース(当たったかどうかの判定)は一切行わない。Cook-Torranceのマイクロ
 // ファセット鏡面BRDF f_r = D(H)F(V,H)G / (4 cosθ_V cosθ_L) を太陽という直接光源に
 // 適用すると、レンダリング方程式 L_o = f_r × E_sun × cosθ_L のcosθ_Lと分母の
-// cosθ_Lが相殺され、L_o = D(H) F(V,H) E_sun / (4 cosθ_V) という形になる
+// cosθ_Lが相殺され、L_o = D(H) F(V,H) G / (4 cosθ_V) という形になる
 // (sky-precise.htmlのNext Event Estimationと同様、確率的サンプリングを伴わない
-// 解析的な直接評価)。幾何減衰項G(マイクロファセット同士の遮蔽)は既知の簡略化として
-// 省略している(グレージング角で明るさをやや過大評価しうる)。
+// 解析的な直接評価)。
+//
+// 幾何減衰項G(マイクロファセット同士の遮蔽・陰影)は、最初の実装では省略していたが、
+// 「まだ強すぎる・太すぎる」という指摘(参考写真と比較)を受けて追加した。Gを省略すると
+// 視線または太陽が水面に対して浅い角度(グレージング、cosθ→0)になるほど、式の
+// 分母cosθ_Vや、D(H)自体がcosθ_Hの4乗で割る項を通じて値が際限なく発散し、水平線際
+// (最も視線が浅くなる箇所)で不自然に幅広く明るい帯になっていた。Gは「隣接する
+// 微小面が別の微小面を遮って、実際には見えない/光が当たらない」割合を表し、
+// 浅い角度ほど遮蔽が増えて実効的な明るさを頭打ちにする、まさにこの発散を抑える項。
+// Smithのマスキング・シャドーイング関数(Walter et al. 2007のBeckmann用有理近似)を
+// 視線側・太陽側それぞれに適用し、G = G1(V)*G1(L) として掛ける。
+fn beckmannG1(cosTheta: f32, alpha: f32) -> f32 {
+  let c = max(cosTheta, 1e-4);
+  let tanTheta = sqrt(max(1.0 - c * c, 0.0)) / c;
+  let a = 1.0 / max(alpha * tanTheta, 1e-4);
+  if (a >= 1.6) {
+    return 1.0;
+  }
+  let a2 = a * a;
+  return (3.535 * a + 2.181 * a2) / (1.0 + 2.276 * a + 2.577 * a2);
+}
 // カメラ近くなど、この画素の傾きがほぼ全て幾何形状で解像されている
 // (unresolvedSlopeVar≈0)場合の下限。実際の海面は、このシェーダーが表現する
 // 最も細かい波(WAVE_MIN_LENGTH=4cm)よりさらに細かいミリメートル級の毛細波
@@ -824,10 +843,12 @@ const CAPILLARY_SLOPE_VAR: f32 = 0.003;
 
 fn sunGlitter(viewDir: vec3<f32>, sunDir: vec3<f32>, rawSigma2: f32) -> f32 {
   let sigma2 = max(rawSigma2, CAPILLARY_SLOPE_VAR);
+  let alpha = sqrt(sigma2); // Beckmannの粗さパラメータ(=傾きの標準偏差)
   let normal = vec3<f32>(0.0, 1.0, 0.0); // 統計モデルが表すのは局所法線からのばらつきなので基準は水平面
   let h = normalize(viewDir + sunDir);
   let cosThetaH = max(dot(normal, h), 1e-4);
   let cosThetaV = max(dot(normal, viewDir), 1e-4);
+  let cosThetaL = max(dot(normal, sunDir), 1e-4);
   let tan2ThetaH = (1.0 - cosThetaH * cosThetaH) / (cosThetaH * cosThetaH);
 
   // Beckmann分布(Cox-Munkのガウス傾き分布と数学的に同じもの)
@@ -835,8 +856,9 @@ fn sunGlitter(viewDir: vec3<f32>, sunDir: vec3<f32>, rawSigma2: f32) -> f32 {
 
   let cosThetaD = max(dot(viewDir, h), 0.0);
   let f = exactFresnel(cosThetaD, 1.0, WATER_IOR);
+  let g = beckmannG1(cosThetaV, alpha) * beckmannG1(cosThetaL, alpha);
 
-  return d * f / (4.0 * cosThetaV);
+  return d * f * g / (4.0 * cosThetaV);
 }
 
 @fragment
@@ -930,13 +952,12 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
           let localDepth = max(seaDepth + hitPos.y, 0.05);
 
           // 海中の単散乱+海底(線形HDR)。水中から空気へ出るときのフレネル透過(1-F)と、
-          // 屈折率n^2による放射輝度の圧縮(水中の輝度は空気側でL/n^2になる)を線形側で
-          // 掛けてから、焼き込みと同じトーンカーブで表示空間へ変換する
+          // 屈折率n^2による放射輝度の圧縮(水中の輝度は空気側でL/n^2になる)を線形側で掛ける
           let underwater = waterRadiance(rayDir, sunDir, turbidity, skyZenithLinear, localDepth, hitPos.xz, normal, waveSample.normalSun)
                          * (1.0 - fresnel) / (WATER_IOR * WATER_IOR);
-          var waterColorResult = tonemapGamma(underwater) + sky * fresnel;
-          // 太陽のグリッター(sunGlitter()、Cox-Munkの統計モデル)。この点の厳密な
-          // 反射方向が太陽と一致するか(reflValid)には関係なく加算する。統計モデルが
+
+          // 太陽のグリッター(sunGlitter()、Cox-Munkの統計モデル、線形HDR)。この点の
+          // 厳密な反射方向が太陽と一致するか(reflValid)には関係なく加算する。統計モデルが
           // 表しているのはこの画素がLODで解像できていない、より細かいスケールの
           // 傾きのばらつき(waveSample.unresolvedSlopeVar)による寄与であり、reflValidの
           // 成否とは独立した現象だから。解像できている波の輝きは既にreflect()による
@@ -945,7 +966,20 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
           // 内部でハーフベクトルに対して評価済みなので、ここで改めてfresnelを掛けない
           // (評価角度の異なる2つのフレネル項が混在するのを避ける)。
           let glitter = sunGlitter(-rayDir, sunDir, waveSample.unresolvedSlopeVar) * sunVisibilityOf(sunDir);
-          waterColorResult += vec3<f32>(1.0, 0.98, 0.92) * SUN_INTENSITY * glitter * highlightIntensity;
+          let glitterRadiance = vec3<f32>(1.0, 0.98, 0.92) * SUN_INTENSITY * glitter * highlightIntensity;
+
+          // 【経緯】以前はunderwaterだけを先にtonemapGamma()で表示空間へ変換してから
+          // glitterRadiance(線形HDR)を無変換のままその上に加算していた。この2つは
+          // 同じ表面点からの物理的に別々の寄与(海中散乱と太陽の鏡面反射)であり、
+          // 本来は線形空間で合算してから1回だけトーンマップすべきところ、既に
+          // 0〜1付近に圧縮済みの表示空間の値へ線形のままの値(場合によっては1を大きく
+          // 超える)を直接足していたため、水平線際の広い範囲がキャンバスの上限で
+          // 一律に真っ白へクリップされ、ユーザーの指摘通り「強すぎる・太すぎる」
+          // 見た目になっていた。underwaterとglitterRadianceを線形のまま合算してから
+          // 1回だけトーンマップすることで、Reinhardの本来の飽和特性(輝度に応じて
+          // なだらかに白へ近づく)が働くようになる。既に表示空間(LDR)で焼き込まれている
+          // sky*fresnelだけは、従来通りトーンマップ後に別途加算する
+          var waterColorResult = tonemapGamma(underwater + glitterRadiance) + sky * fresnel;
           sampleColor = waterColorResult;
         }
       }
