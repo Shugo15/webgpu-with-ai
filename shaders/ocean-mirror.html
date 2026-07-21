@@ -956,15 +956,27 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
           let underwater = waterRadiance(rayDir, sunDir, turbidity, skyZenithLinear, localDepth, hitPos.xz, normal, waveSample.normalSun)
                          * (1.0 - fresnel) / (WATER_IOR * WATER_IOR);
 
+          // 解像できている波の輝き: reflDirが厳密に太陽方向と一致する(=大スケールの
+          // 波が偶然ぴったり反射する)場合の、なす角ベースの真円ハイライト。sunDisc()と
+          // 同じ式を直視の太陽と共有している(SUN_ANGULAR_RADIUS参照)。reflValidの
+          // ときだけ意味を持つ(無効なreflDirにdotを取っても無意味なため)。
+          // 【経緯】この項はsunGlitter()を追加した際に誤って削除されていた。コメントには
+          // 「解像できている波の輝きは既にsunDisc()側に含まれている」と書いたまま、
+          // 実際の呼び出しをsunGlitter()に置き換えてしまっており、結果として解像された
+          // 大スケールの波が太陽を正確に反射するケースの鋭いハイライトが一切描画されない
+          // 状態になっていた(ぼやけた統計的きらめきしか出ない)。改めて復元する。
+          let discHighlight = select(0.0, sunDisc(reflDir, sunDir, SUN_ANGULAR_RADIUS), reflValid)
+                             * sunVisibilityOf(sunDir);
+
           // 太陽のグリッター(sunGlitter()、Cox-Munkの統計モデル、線形HDR)。この点の
           // 厳密な反射方向が太陽と一致するか(reflValid)には関係なく加算する。統計モデルが
           // 表しているのはこの画素がLODで解像できていない、より細かいスケールの
           // 傾きのばらつき(waveSample.unresolvedSlopeVar)による寄与であり、reflValidの
-          // 成否とは独立した現象だから。解像できている波の輝きは既にreflect()による
-          // 幾何学的な鏡面反射(sky*fresnel、sunDisc())側に含まれているので、ここでは
-          // 解像できていない分だけを渡して二重計上を避ける。フレネル項はsunGlitter()
-          // 内部でハーフベクトルに対して評価済みなので、ここで改めてfresnelを掛けない
-          // (評価角度の異なる2つのフレネル項が混在するのを避ける)。
+          // 成否とは独立した現象だから。解像できている波の輝きは上のdiscHighlightに
+          // 含まれているので、ここでは解像できていない分だけを渡して二重計上を避ける。
+          // フレネル項はsunGlitter()内部でハーフベクトルに対して評価済みなので、
+          // ここで改めてfresnelを掛けない(評価角度の異なる2つのフレネル項が
+          // 混在するのを避ける)。
           let glitter = sunGlitter(-rayDir, sunDir, waveSample.unresolvedSlopeVar) * sunVisibilityOf(sunDir);
           let glitterRadiance = vec3<f32>(1.0, 0.98, 0.92) * SUN_INTENSITY * glitter * highlightIntensity;
 
@@ -978,8 +990,11 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
           // 見た目になっていた。underwaterとglitterRadianceを線形のまま合算してから
           // 1回だけトーンマップすることで、Reinhardの本来の飽和特性(輝度に応じて
           // なだらかに白へ近づく)が働くようになる。既に表示空間(LDR)で焼き込まれている
-          // sky*fresnelだけは、従来通りトーンマップ後に別途加算する
-          var waterColorResult = tonemapGamma(underwater + glitterRadiance) + sky * fresnel;
+          // sky*fresnelと、直視の太陽円盤と同じ0..1のマスク値であるdiscHighlight
+          // (線形HDRではないので他と一緒にトーンマップしない)だけは、従来通り
+          // トーンマップ後に別途加算する
+          var waterColorResult = tonemapGamma(underwater + glitterRadiance) + sky * fresnel
+                                + vec3<f32>(1.0, 0.98, 0.92) * discHighlight * fresnel * highlightIntensity;
           sampleColor = waterColorResult;
         }
       }
