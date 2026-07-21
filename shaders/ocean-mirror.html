@@ -485,25 +485,6 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
   return WaveSample(normal, normalSun, height, unresolvedVar);
 }
 
-// 波のスペクトルから傾き(slope = 水平方向の勾配)の分散を解析的に求める。
-// gerstnerSample()と全く同じハッシュ疑似乱数で波長・振幅を再構成し(向き・位相・時刻は
-// 分散に影響しないので省略)、正弦波1本あたりの勾配の分散(amp*k)²/2(時間平均)を
-// 全波について足し合わせる。位置にも時刻にも依存しない、スペクトル全体を表す
-// 統計量なので、1フレームにつき1回だけ計算すればよい(下記sunGlitter()参照)。
-fn waveSlopeVariance() -> f32 {
-  var sigma2 = 0.0;
-  for (var i = 0u; i < NUM_WAVES; i = i + 1u) {
-    let t = f32(i) / f32(NUM_WAVES - 1u);
-    let baseLength = WAVE_MAX_LENGTH * pow(WAVE_MIN_LENGTH / WAVE_MAX_LENGTH, t);
-    let lengthJitter = 1.0 + (waveHash(i, 3.1) - 0.5) * 0.3;
-    let wavelength = baseLength * lengthJitter;
-    let k = 2.0 * PI / wavelength;
-    let amp = WAVE_STEEPNESS * wavelength * (0.85 + 0.3 * waveHash(i, 7.7));
-    sigma2 += (amp * k) * (amp * k) * 0.5;
-  }
-  return sigma2;
-}
-
 // レイと実際の波面(高さフィールド)の交差点を、区間探索+二分探索で求める
 // (shaders/ocean-gerstner.htmlのintersectWater()と同じアルゴリズム)。
 // 近距離は細かく・遠距離は粗くステップすることで、波の見た目の精度を落とさずに
@@ -809,9 +790,16 @@ const SUN_ANGULAR_RADIUS: f32 = 0.02;
 // Cox & Munkは実際の太陽グリッターの写真から、風で波立った海面の傾きがほぼガウス
 // 分布に従うことを実測で示した。これはレンダリングにおけるBeckmann分布(マイクロ
 // ファセットBRDFの法線分布関数)と数学的に同じもので、個々の面の向きを1つずつ
-// 判定する代わりに、波の傾きの分散sigma2(waveSlopeVariance()で今のスペクトルから
-// 解析的に求める。新しい自由パラメータは増やしていない)を使って「この点が統計的に
-// 太陽方向を向いている確率密度」を連続的に計算する。
+// 判定する代わりに、傾きの分散sigma2を使って「この点が統計的に太陽方向を向いている
+// 確率密度」を連続的に計算する。
+//
+// sigma2には波スペクトル全体の分散ではなく、呼び出し側でWaveSample.unresolvedSlopeVar
+// (gerstnerSample()参照。距離によるLODフェードでこの画素が幾何形状として解像できて
+// いない、より細かいスケールの傾きの分散)を渡す。解像できている大スケールの傾きは
+// 既にnormalとして幾何学的な鏡面反射(reflect()、sunDisc())に正しく反映されているので、
+// そこにさらに統計モデルを重ねると同じ太陽の輝きを二重計上してしまう。解像できていない
+// 分だけを統計的に均して表現することで、二重計上を避けつつ「近くは幾何学的な鏡面反射、
+// 遠くは統計的なきらめき」への滑らかな遷移になる。
 //
 // レイトレース(当たったかどうかの判定)は一切行わない。Cook-Torranceのマイクロ
 // ファセット鏡面BRDF f_r = D(H)F(V,H)G / (4 cosθ_V cosθ_L) を太陽という直接光源に
@@ -820,7 +808,10 @@ const SUN_ANGULAR_RADIUS: f32 = 0.02;
 // (sky-precise.htmlのNext Event Estimationと同様、確率的サンプリングを伴わない
 // 解析的な直接評価)。幾何減衰項G(マイクロファセット同士の遮蔽)は既知の簡略化として
 // 省略している(グレージング角で明るさをやや過大評価しうる)。
-fn sunGlitter(viewDir: vec3<f32>, sunDir: vec3<f32>, sigma2: f32) -> f32 {
+fn sunGlitter(viewDir: vec3<f32>, sunDir: vec3<f32>, rawSigma2: f32) -> f32 {
+  // カメラ直下など、この画素の傾きがほぼ全て幾何形状で解像されている(unresolvedSlopeVar≈0)
+  // 場合にsigma2→0でD()が0/0または発散するのを避ける下限
+  let sigma2 = max(rawSigma2, 1e-5);
   let normal = vec3<f32>(0.0, 1.0, 0.0); // 統計モデルが表すのは局所法線からのばらつきなので基準は水平面
   let h = normalize(viewDir + sunDir);
   let cosThetaH = max(dot(normal, h), 1e-4);
@@ -848,10 +839,6 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let renderDistance = uniforms.waterParams.w;
   let debugHighlight = uniforms.debugParams.x > 0.5;
   let debugColor = uniforms.debugParams.yzw;
-
-  // 波の傾きの分散(sunGlitter()で使う)。位置にも時刻にも依存しないスペクトル全体の
-  // 統計量なので、AAサンプルのループの外で1回だけ計算する
-  let slopeSigma2 = waveSlopeVariance();
 
   // 天空光の代表値としてインポートした空の天頂輝度を1回サンプリングし、LDR(トーンマップ済み)
   // から逆Reinhard(ガンマ2.2 -> m/(1-m)、飽和対策で0.98にクランプ)で概算の線形HDRへ戻す。
@@ -938,12 +925,14 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
           var waterColorResult = tonemapGamma(underwater) + sky * fresnel;
           // 太陽のグリッター(sunGlitter()、Cox-Munkの統計モデル)。この点の厳密な
           // 反射方向が太陽と一致するか(reflValid)には関係なく加算する。統計モデルが
-          // 表しているのはこのシェーダーの16波では解像できない、より細かいスケールの
-          // 傾きのばらつきによる寄与であり、reflValidの成否とは独立した現象だから。
-          // フレネル項はsunGlitter()内部でハーフベクトルに対して評価済みなので、
-          // ここで改めてfresnelを掛けない(評価角度の異なる2つのフレネル項が
-          // 混在するのを避ける)。
-          let glitter = sunGlitter(-rayDir, sunDir, slopeSigma2) * sunVisibilityOf(sunDir);
+          // 表しているのはこの画素がLODで解像できていない、より細かいスケールの
+          // 傾きのばらつき(waveSample.unresolvedSlopeVar)による寄与であり、reflValidの
+          // 成否とは独立した現象だから。解像できている波の輝きは既にreflect()による
+          // 幾何学的な鏡面反射(sky*fresnel、sunDisc())側に含まれているので、ここでは
+          // 解像できていない分だけを渡して二重計上を避ける。フレネル項はsunGlitter()
+          // 内部でハーフベクトルに対して評価済みなので、ここで改めてfresnelを掛けない
+          // (評価角度の異なる2つのフレネル項が混在するのを避ける)。
+          let glitter = sunGlitter(-rayDir, sunDir, waveSample.unresolvedSlopeVar) * sunVisibilityOf(sunDir);
           waterColorResult += vec3<f32>(1.0, 0.98, 0.92) * SUN_INTENSITY * glitter * highlightIntensity;
           sampleColor = waterColorResult;
         }
