@@ -485,6 +485,24 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
   return WaveSample(normal, normalSun, height, unresolvedVar);
 }
 
+// 波のスペクトルから傾き(slope = 水平方向の勾配)の分散を解析的に求める。
+// gerstnerSample()と全く同じハッシュ疑似乱数で波長・振幅を再構成し(向き・位相・時刻は
+// 分散に影響しないので省略)、正弦波1本あたりの勾配の分散(amp*k)²/2(時間平均)を
+// 全波について足し合わせる。位置にも時刻にも依存しない、スペクトル全体を表す
+// 統計量なので、1フレームにつき1回だけ計算すればよい(下記sunGlitter()参照)。
+fn waveSlopeVariance() -> f32 {
+  var sigma2 = 0.0;
+  for (var i = 0u; i < NUM_WAVES; i = i + 1u) {
+    let t = f32(i) / f32(NUM_WAVES - 1u);
+    let baseLength = WAVE_MAX_LENGTH * pow(WAVE_MIN_LENGTH / WAVE_MAX_LENGTH, t);
+    let lengthJitter = 1.0 + (waveHash(i, 3.1) - 0.5) * 0.3;
+    let wavelength = baseLength * lengthJitter;
+    let k = 2.0 * PI / wavelength;
+    let amp = WAVE_STEEPNESS * wavelength * (0.85 + 0.3 * waveHash(i, 7.7));
+    sigma2 += (amp * k) * (amp * k) * 0.5;
+  }
+  return sigma2;
+}
 
 // レイと実際の波面(高さフィールド)の交差点を、区間探索+二分探索で求める
 // (shaders/ocean-gerstner.htmlのintersectWater()と同じアルゴリズム)。
@@ -752,15 +770,25 @@ fn waterRadiance(rayDir: vec3<f32>, sunDir: vec3<f32>, turbidity: f32, skyZenith
 // スライダーだけを演出用の全体倍率として残している(0にすると反射側のハイライトだけを
 // 消せる。直視の太陽はスライダーの影響を受けない)。
 //
-// 【重要】最初はshaders/ocean-gerstner.htmlのsunGlitter()と同じBlinn-Phong方式
-// (視線と太陽方向のハーフベクトルhalfDir=normalize(view+sun)と法線の内積のべき乗)を
-// そのまま流用したが、これは水面全体に無数の異なる傾きの微小面がある「粗い」水面を
-// 前提にした近似であり、視線が浅い角度になるほどhalfDirと法線のなす角が真の反射角
-// (reflDirとsunDirのなす角)からずれていく性質がある。roughnessゼロの完全な平面に
-// このズレをそのまま持ち込むと、水平線に近づくほどハイライトが手前に間延びした涙形
-// (いわゆる写真の"sun glitter path")になってしまい、平らな鏡面では本来歪まず円形に
-// 映るはずの太陽の形と矛盾する。反射方向と太陽方向の「なす角」だけに依存する円盤の式
-// (下記)に置き換えることで、視線角度によらず常に真円のハイライトになる。
+// 【重要・当時の経緯】最初はshaders/ocean-gerstner.htmlのsunGlitter()と同じ
+// Blinn-Phong方式(視線と太陽方向のハーフベクトルhalfDir=normalize(view+sun)と
+// 法線の内積のべき乗)をそのまま流用したが、これは水面全体に無数の異なる傾きの
+// 微小面がある「粗い」水面を前提にした近似であり、視線が浅い角度になるほど
+// halfDirと法線のなす角が真の反射角(reflDirとsunDirのなす角)からずれていく
+// 性質がある。当時はこのシェーダーの水面が波の無い完全な平面だったため、roughness
+// ゼロの完全な平面にこのズレをそのまま持ち込むと、水平線に近づくほどハイライトが
+// 手前に間延びした涙形(いわゆる写真の"sun glitter path")になってしまい、平らな
+// 鏡面では本来歪まず円形に映るはずの太陽の形と矛盾していた。そのため反射方向と
+// 太陽方向の「なす角」だけに依存する、視線角度によらず常に真円になる円盤の式
+// (下記sunDisc())に置き換えた。
+//
+// 【現在】その後ガーストナー波を導入し、水面は実際に無数の傾きを持つようになった
+// (README「波の形状をリファレンス写真に近づける」参照)。この条件下では涙形の
+// グリッターパスはむしろ物理的に正しい現象(Cox & Munk 1954が実測で示した、
+// 風で波立った海面の傾きの統計分布による太陽グリッター)であり、下記sunGlitter()
+// で改めて統計的に(トレースせず、波の傾きの分散から解析的に)計算している。
+// sunDisc()は「直視の太陽本体」と「反射方向を厳密に追跡した多重反射」でのみ使う、
+// なす角に基づく真円のハイライトとして引き続き利用している。
 fn sunDisc(reflDir: vec3<f32>, sunDir: vec3<f32>, outerRadius: f32) -> f32 {
   let cosAngle = dot(reflDir, sunDir);
   let cosOuter = cos(outerRadius);
@@ -769,9 +797,44 @@ fn sunDisc(reflDir: vec3<f32>, sunDir: vec3<f32>, outerRadius: f32) -> f32 {
 }
 
 // 実際の太陽の見かけの角半径(sky-precise.htmlのSUN_ANGULAR_RADIUS_OUTERと同じ)。
-// 直視・反射どちらの太陽円盤もこの固定値で描く(roughness=0の平面鏡には
-// 「反射だけ滲ませる」物理的な根拠が無いため)。
+// 直視の太陽円盤はこの固定値で描く(反射側の太陽グリッターは下記sunGlitter()を使う)。
 const SUN_ANGULAR_RADIUS: f32 = 0.02;
+
+// 太陽のグリッター(水面のきらめき)をCox & Munk (1954)の統計モデルで計算する。
+// 実際の海面は無数の波(理論上は連続スペクトル)が重なっているが、このシェーダーは
+// (swiftshaderのコンパイラの上限で)NUM_WAVES本までしか重ね合わせられず、個々の点の
+// 正確な法線が偶然太陽を向くかという二値判定(sunDisc)では、リファレンス写真と
+// 比べて輝きが疎になり弱く見えてしまう(実際にユーザーから指摘された)。
+//
+// Cox & Munkは実際の太陽グリッターの写真から、風で波立った海面の傾きがほぼガウス
+// 分布に従うことを実測で示した。これはレンダリングにおけるBeckmann分布(マイクロ
+// ファセットBRDFの法線分布関数)と数学的に同じもので、個々の面の向きを1つずつ
+// 判定する代わりに、波の傾きの分散sigma2(waveSlopeVariance()で今のスペクトルから
+// 解析的に求める。新しい自由パラメータは増やしていない)を使って「この点が統計的に
+// 太陽方向を向いている確率密度」を連続的に計算する。
+//
+// レイトレース(当たったかどうかの判定)は一切行わない。Cook-Torranceのマイクロ
+// ファセット鏡面BRDF f_r = D(H)F(V,H)G / (4 cosθ_V cosθ_L) を太陽という直接光源に
+// 適用すると、レンダリング方程式 L_o = f_r × E_sun × cosθ_L のcosθ_Lと分母の
+// cosθ_Lが相殺され、L_o = D(H) F(V,H) E_sun / (4 cosθ_V) という形になる
+// (sky-precise.htmlのNext Event Estimationと同様、確率的サンプリングを伴わない
+// 解析的な直接評価)。幾何減衰項G(マイクロファセット同士の遮蔽)は既知の簡略化として
+// 省略している(グレージング角で明るさをやや過大評価しうる)。
+fn sunGlitter(viewDir: vec3<f32>, sunDir: vec3<f32>, sigma2: f32) -> f32 {
+  let normal = vec3<f32>(0.0, 1.0, 0.0); // 統計モデルが表すのは局所法線からのばらつきなので基準は水平面
+  let h = normalize(viewDir + sunDir);
+  let cosThetaH = max(dot(normal, h), 1e-4);
+  let cosThetaV = max(dot(normal, viewDir), 1e-4);
+  let tan2ThetaH = (1.0 - cosThetaH * cosThetaH) / (cosThetaH * cosThetaH);
+
+  // Beckmann分布(Cox-Munkのガウス傾き分布と数学的に同じもの)
+  let d = exp(-tan2ThetaH / sigma2) / (PI * sigma2 * cosThetaH * cosThetaH * cosThetaH * cosThetaH);
+
+  let cosThetaD = max(dot(viewDir, h), 0.0);
+  let f = exactFresnel(cosThetaD, 1.0, WATER_IOR);
+
+  return d * f / (4.0 * cosThetaV);
+}
 
 @fragment
 fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
@@ -785,6 +848,10 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
   let renderDistance = uniforms.waterParams.w;
   let debugHighlight = uniforms.debugParams.x > 0.5;
   let debugColor = uniforms.debugParams.yzw;
+
+  // 波の傾きの分散(sunGlitter()で使う)。位置にも時刻にも依存しないスペクトル全体の
+  // 統計量なので、AAサンプルのループの外で1回だけ計算する
+  let slopeSigma2 = waveSlopeVariance();
 
   // 天空光の代表値としてインポートした空の天頂輝度を1回サンプリングし、LDR(トーンマップ済み)
   // から逆Reinhard(ガンマ2.2 -> m/(1-m)、飽和対策で0.98にクランプ)で概算の線形HDRへ戻す。
@@ -853,7 +920,6 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
           // (水面が水面自身を映す、それらしい暗い水色。shaders/ocean-gerstner.htmlの
           // 同種のフォールバックと同じ考え方)
           let sky = select(vec3<f32>(0.02, 0.05, 0.08), sampleSky(reflDir), reflValid);
-          let disc = select(0.0, sunDisc(reflDir, sunDir, SUN_ANGULAR_RADIUS) * sunVisibilityOf(sunDir), reflValid);
 
           // Fresnel(厳密な式。屈折角はSnellの法則から内部で求める):
           // dot(視線, 法線) = dot(-rayDir, normal)
@@ -870,9 +936,15 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
           let underwater = waterRadiance(rayDir, sunDir, turbidity, skyZenithLinear, localDepth, hitPos.xz, normal, waveSample.normalSun)
                          * (1.0 - fresnel) / (WATER_IOR * WATER_IOR);
           var waterColorResult = tonemapGamma(underwater) + sky * fresnel;
-          // 太陽のハイライトも他の反射成分と同じくフレネル反射率で重み付けする
-          // (反射である以上、視線角度に応じて2%〜100%に変化するのが物理的に正しい)
-          waterColorResult += vec3<f32>(1.0, 0.98, 0.92) * disc * fresnel * highlightIntensity;
+          // 太陽のグリッター(sunGlitter()、Cox-Munkの統計モデル)。この点の厳密な
+          // 反射方向が太陽と一致するか(reflValid)には関係なく加算する。統計モデルが
+          // 表しているのはこのシェーダーの16波では解像できない、より細かいスケールの
+          // 傾きのばらつきによる寄与であり、reflValidの成否とは独立した現象だから。
+          // フレネル項はsunGlitter()内部でハーフベクトルに対して評価済みなので、
+          // ここで改めてfresnelを掛けない(評価角度の異なる2つのフレネル項が
+          // 混在するのを避ける)。
+          let glitter = sunGlitter(-rayDir, sunDir, slopeSigma2) * sunVisibilityOf(sunDir);
+          waterColorResult += vec3<f32>(1.0, 0.98, 0.92) * SUN_INTENSITY * glitter * highlightIntensity;
           sampleColor = waterColorResult;
         }
       }
