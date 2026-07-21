@@ -494,7 +494,17 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
 // 粗くなってしまう(波を飛び越えて交点を見逃しうる)。描画距離を伸ばしても精度を
 // 落とさないよう、遠距離側はステップ幅がTARGET_FAR_STEP以下に収まる本数
 // (最低8本)を動的に確保する。負荷は描画距離に比例して増えるが、それは許容する。
-const TARGET_FAR_STEP: f32 = 1.5; // 最も波長の短い「大きなうねり」(4.5m)の半分未満に抑える
+//
+// 【重要】この目標ステップ幅は波長(wavelength)だけを基準にしており、「波の高さ」
+// スライダー(ampScale)では一切スケールしていなかった。波長が同じでも振幅が
+// 大きい(=傾きが急な)波ほど、水平に近いレイの軌跡が波面の上下動の範囲に長く
+// 「捕まる」ため、1ステップ内でレイが波面と複数回交差しうる区間が長くなり、
+// 固定ステップ幅では交差そのものを取りこぼしやすくなる(waveSample.normalが
+// sunGlitter()の統計分布の基準面に直結するようになった後、この取りこぼしが
+// 中距離以遠のきらめきの乱れとして目に見える形で現れた。ユーザーからの指摘で発覚)。
+// WAVE_HEIGHT_MARGINと同じ「縮む方向には縮めず、既定値を下限にする」パターンで、
+// ampScaleが1.0を超えるぶんだけ目標ステップ幅を狭める。
+const TARGET_FAR_STEP: f32 = 1.5; // 最も波長の短い「大きなうねり」(4.5m)の半分未満に抑える(ampScale=1.0基準)
 // 近距離側の範囲(nearDist)も、カメラの高さro.yにゆるく比例させる。固定値のままだと、
 // カメラを高くしたぶんだけ同じ画面位置のレイがy=0に届くまでのスラント距離が
 // (ほぼ比例して)伸びるため、精密な近距離域を素通りして粗い遠距離域まで探索する
@@ -523,8 +533,9 @@ fn intersectWater(ro: vec3<f32>, rd: vec3<f32>, time: f32, maxDist: f32) -> vec4
   let nearSteps = NEAR_STEPS;
   let nearStep = nearDist / f32(nearSteps);
 
+  let farStepTarget = TARGET_FAR_STEP / max(uniforms.waveParams.x, 1.0);
   let farDist = max(maxDist - nearDist, 1.0);
-  let farSteps = max(u32(ceil(farDist / TARGET_FAR_STEP)), 8u);
+  let farSteps = max(u32(ceil(farDist / farStepTarget)), 8u);
   let farStep = farDist / f32(farSteps);
 
   let steps = nearSteps + farSteps;
