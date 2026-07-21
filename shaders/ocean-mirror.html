@@ -808,10 +808,22 @@ const SUN_ANGULAR_RADIUS: f32 = 0.02;
 // (sky-precise.htmlのNext Event Estimationと同様、確率的サンプリングを伴わない
 // 解析的な直接評価)。幾何減衰項G(マイクロファセット同士の遮蔽)は既知の簡略化として
 // 省略している(グレージング角で明るさをやや過大評価しうる)。
+// カメラ近くなど、この画素の傾きがほぼ全て幾何形状で解像されている
+// (unresolvedSlopeVar≈0)場合の下限。実際の海面は、このシェーダーが表現する
+// 最も細かい波(WAVE_MIN_LENGTH=4cm)よりさらに細かいミリメートル級の毛細波
+// (capillary wave)を常に持ち、どんなに近くで見ても水面は真の意味で完全な
+// 鏡面にはならない。Cox & Munk (1954)自身の風速依存式 sigma2 = 0.003 + 5.12e-3*W
+// (W=風速m/s)はW=0(無風)でもsigma2=0.003という非ゼロの下限を与えており、
+// これがまさにこの「常に存在する毛細波によるぼやけ」を表す値である。
+// 【経緯】単なる発散防止の下限(1e-5)のままだと、幾何形状でほぼ解像された
+// 場所でもsigma2が極端に小さくなり、Beckmann分布のピークが際限なく尖って
+// (D()のピークは1/(pi*sigma2)に比例)ハイライトが過度に強く・広く飽和して
+// 見えてしまった(ユーザーから「ハイライトが強すぎる」と指摘)。Cox-Munkの
+// 無風時の値を下限として採用することで、物理的な根拠を保ったまま過飽和を抑えている。
+const CAPILLARY_SLOPE_VAR: f32 = 0.003;
+
 fn sunGlitter(viewDir: vec3<f32>, sunDir: vec3<f32>, rawSigma2: f32) -> f32 {
-  // カメラ直下など、この画素の傾きがほぼ全て幾何形状で解像されている(unresolvedSlopeVar≈0)
-  // 場合にsigma2→0でD()が0/0または発散するのを避ける下限
-  let sigma2 = max(rawSigma2, 1e-5);
+  let sigma2 = max(rawSigma2, CAPILLARY_SLOPE_VAR);
   let normal = vec3<f32>(0.0, 1.0, 0.0); // 統計モデルが表すのは局所法線からのばらつきなので基準は水平面
   let h = normalize(viewDir + sunDir);
   let cosThetaH = max(dot(normal, h), 1e-4);
