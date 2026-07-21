@@ -801,6 +801,19 @@ const SUN_ANGULAR_RADIUS: f32 = 0.02;
 // 分だけを統計的に均して表現することで、二重計上を避けつつ「近くは幾何学的な鏡面反射、
 // 遠くは統計的なきらめき」への滑らかな遷移になる。
 //
+// 同じ理由で、統計分布の基準面(macroNormal引数)も世界座標の真上(0,1,0)固定ではなく、
+// 呼び出し側のwaveSample.normal(解像できているスケールの局所法線。「波の高さ」
+// スライダーで波を大きくするほど傾く)を渡す。unresolvedSlopeVarが表しているのは
+// 「解像できているこの局所面から、さらに細かい波がどれだけばらつくか」であって、
+// 世界の水平面からのばらつきではない。基準を世界の真上に固定したままだと、波を
+// どれだけ高くしても(=解像できる大スケールの傾きがどれだけ急になっても)
+// sunGlitter()が「光る場所」自体は動かず、統計分布の広がり(sigma2、unresolvedSlopeVar
+// 経由でわずかに増えるだけ)しか変化しない。これは通常マップ+粗さのマイクロファセット
+// シェーディングで、粗さ由来のNDFを常にワールド座標の真上ではなく法線マップ後の
+// 局所シェーディング法線を基準に評価するのと同じ理屈で、discHighlight(reflect()による
+// 厳密な鏡面反射)と統計分布の基準がずれていると、両者のピークが別方向を向く
+// (=同じ点なのに「厳密な反射光」と「統計的きらめき」が矛盾した方向に出る)ことになる。
+//
 // レイトレース(当たったかどうかの判定)は一切行わない。Cook-Torranceのマイクロ
 // ファセット鏡面BRDF f_r = D(H)F(V,H)G / (4 cosθ_V cosθ_L) を太陽という直接光源に
 // 適用すると、レンダリング方程式 L_o = f_r × E_sun × cosθ_L のcosθ_Lと分母の
@@ -841,10 +854,10 @@ fn beckmannG1(cosTheta: f32, alpha: f32) -> f32 {
 // 無風時の値を下限として採用することで、物理的な根拠を保ったまま過飽和を抑えている。
 const CAPILLARY_SLOPE_VAR: f32 = 0.003;
 
-fn sunGlitter(viewDir: vec3<f32>, sunDir: vec3<f32>, rawSigma2: f32) -> f32 {
+fn sunGlitter(viewDir: vec3<f32>, sunDir: vec3<f32>, rawSigma2: f32, macroNormal: vec3<f32>) -> f32 {
   let sigma2 = max(rawSigma2, CAPILLARY_SLOPE_VAR);
   let alpha = sqrt(sigma2); // Beckmannの粗さパラメータ(=傾きの標準偏差)
-  let normal = vec3<f32>(0.0, 1.0, 0.0); // 統計モデルが表すのは局所法線からのばらつきなので基準は水平面
+  let normal = macroNormal; // 統計モデルが表すのは「解像できている局所法線」からのばらつき
   let h = normalize(viewDir + sunDir);
   let cosThetaH = max(dot(normal, h), 1e-4);
   let cosThetaV = max(dot(normal, viewDir), 1e-4);
@@ -977,7 +990,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
           // フレネル項はsunGlitter()内部でハーフベクトルに対して評価済みなので、
           // ここで改めてfresnelを掛けない(評価角度の異なる2つのフレネル項が
           // 混在するのを避ける)。
-          let glitter = sunGlitter(-rayDir, sunDir, waveSample.unresolvedSlopeVar) * sunVisibilityOf(sunDir);
+          let glitter = sunGlitter(-rayDir, sunDir, waveSample.unresolvedSlopeVar, normal) * sunVisibilityOf(sunDir);
           let glitterRadiance = vec3<f32>(1.0, 0.98, 0.92) * SUN_INTENSITY * glitter * highlightIntensity;
 
           // 【経緯】以前はunderwaterだけを先にtonemapGamma()で表示空間へ変換してから
