@@ -363,6 +363,27 @@ const WAVE_STEEPNESS: f32 = 0.032; // 各波の傾き(振幅/波長)の目安
 const WAVE_CHOPPINESS: f32 = 1.1;  // トロコイドが尖りすぎない(自己交差しない)ように抑える全体の急峻さ
 const WIND_DIR = vec2<f32>(0.9435, 0.3313); // normalize(vec2(1.0, 0.35))。海底の砂紋と同じ向き
 
+// 支配的なうねり(背景スウェル)。波0番だけを、WAVE_MAX_LENGTH〜WAVE_MIN_LENGTHの
+// 対数分布から外して、この専用の長波長に固定する。
+// 【経緯】ユーザーから「遠距離ではハイライトの形が波を反映していない」と指摘された。
+// 実際、下記WAVE_LOD_FADE_ENDの式で最大の波(WAVE_MAX_LENGTH=6m、「波の周期」
+// スライダー最大300%でも18m)がLODで完全に消える距離を計算すると110〜190m程度しかなく、
+// 「描画距離」スライダーが最大1500mまで許容しているのに対して、その大半(200m以遠)は
+// 波0本ぶんの寄与も残らない完全な平面になっていた。この距離まで来ると統計モデル
+// (sunGlitter())の基準面(waveSample.normal)が視線角度だけで決まる真っ平らな鏡と
+// 同じになり、ハイライトの形が波の位置と無関係な、視線角度だけの一般的な涙形に
+// 収束してしまう(これが「形が波を反映していない」の正体)。
+// 実際の外洋のうねりは波長60〜200m級で、この規模の波はもっと遠くまで見た目で
+// 判別できる(実写の水平線際でもうねりの起伏が見える)。NUM_WAVESは17以上に
+// できない制約(上記コメント参照)があるため、既存16本のうち1本(波長分布の
+// 最大側)をこの専用の長波長に差し替え、残り15本で従来通りWAVE_MAX_LENGTH〜
+// WAVE_MIN_LENGTHの分布を維持する(近距離の見た目の密度はほぼ変えない)。
+// 傾き(BACKGROUND_SWELL_STEEPNESS)はWAVE_STEEPNESSより意図的に緩くしてある。
+// 実際のうねりは波長の割に傾きが緩やか(荒れた風波と違って滑らかに盛り上がる)で、
+// WAVE_STEEPNESSのまま80mの波長に適用すると振幅が2.5m超になり見た目が破綻するため。
+const BACKGROUND_SWELL_LENGTH: f32 = 80.0;
+const BACKGROUND_SWELL_STEEPNESS: f32 = 0.01;
+
 // 固定カメラの位置(fs_mainと、waterRadiance()内の海底模様のフェード距離の計算で共用)
 const CAMERA_POS = vec3<f32>(0.0, 4.5, 0.0);
 
@@ -430,14 +451,23 @@ fn gerstnerSample(pos: vec2<f32>, time: f32) -> WaveSample {
   var unresolvedVar = 0.0;
 
   for (var i = 0u; i < NUM_WAVES; i = i + 1u) {
-    let t = f32(i) / f32(NUM_WAVES - 1u); // 0(最大の波長)..1(最小の波長)
+    // 波0番だけは対数分布から外し、専用の長波長うねり(BACKGROUND_SWELL_LENGTH)にする
+    // (上のBACKGROUND_SWELL_LENGTHのコメント参照)。残り15本(i=1..15)で従来通り
+    // WAVE_MAX_LENGTH〜WAVE_MIN_LENGTHの対数分布を維持する
+    let isBackgroundSwell = i == 0u;
+    let t = f32(max(i, 1u) - 1u) / f32(NUM_WAVES - 2u); // 0(最大の波長)..1(最小の波長)。i=0では未使用
 
-    let baseLength = WAVE_MAX_LENGTH * pow(WAVE_MIN_LENGTH / WAVE_MAX_LENGTH, t);
+    let baseLength = select(
+      WAVE_MAX_LENGTH * pow(WAVE_MIN_LENGTH / WAVE_MAX_LENGTH, t),
+      BACKGROUND_SWELL_LENGTH,
+      isBackgroundSwell
+    );
     let lengthJitter = 1.0 + (waveHash(i, 3.1) - 0.5) * 0.3;
     let wavelength = baseLength * lengthJitter * lenScale;
     let k = 2.0 * PI / wavelength;
 
-    let amp = WAVE_STEEPNESS * wavelength * (0.85 + 0.3 * waveHash(i, 7.7));
+    let steepness = select(WAVE_STEEPNESS, BACKGROUND_SWELL_STEEPNESS, isBackgroundSwell);
+    let amp = steepness * wavelength * (0.85 + 0.3 * waveHash(i, 7.7));
 
     // 波長が短いほど風向きからのばらつき(広がり角)を大きくする
     let spreadRange = mix(0.35, 2.2, t);
